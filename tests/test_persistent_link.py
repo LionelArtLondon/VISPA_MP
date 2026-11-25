@@ -49,11 +49,12 @@ def test_running_the_script_again_replaces_the_old_copy(tmp_path):
         time.sleep(0.01)
     time.sleep(1.1)  # a later start second, as when the user runs the menu again
     second, second_outcome = _serve_in_background(link)
-    first.join(timeout=3)
+    # Generous waits: on a busy machine (a virus scan after an install) 3 s was not enough.
+    first.join(timeout=15)
     assert first_outcome == ["replaced"]
-    assert MailboxClient(link, timeout=3).ping() == {"ok": True}
-    stop_link(link)
-    second.join(timeout=3)
+    assert MailboxClient(link, timeout=15).ping() == {"ok": True}
+    stop_link(link, timeout=15)
+    second.join(timeout=15)
     assert second_outcome == ["stopped"]
 
 
