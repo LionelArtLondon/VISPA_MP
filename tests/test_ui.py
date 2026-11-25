@@ -236,3 +236,114 @@ def test_page_cards_sit_side_by_side_without_overlapping(qapp):
             assert not card.geometry().intersects(other.geometry())
     # All of them in view at once: the page wraps into rows instead of scrolling sideways.
     assert all(card.geometry().right() <= window.thumb_area.viewport().width() for card in cards)
+
+
+def _review(qapp, analysis=None):
+    window = MainWindow(client=None)
+    window.set_setting("episode_minutes", 0)
+    window.show_analysis(analysis or three_page_analysis())
+    window.resize(1400, 860)
+    window.show()
+    qapp.processEvents()
+    return window
+
+
+def test_the_filter_shows_core_images_or_every_page_start(qapp):
+    window = _review(qapp, action_analysis())
+    window._select_page(window.pages[0]["id"])
+    every = window._view_items()
+    assert any(item["proposal"]["color"] == "Cyan" for item in every)
+    window._set_filter("core")
+    assert all(item["proposal"]["color"] in ("Green", "Blue") for item in window._view_items())
+    other = _review(qapp)
+    other._set_filter("starts")
+    starts = other._view_items()
+    assert [item["proposal"]["color"] for item in starts] == ["Green"] * len(other.pages)
+    assert other.thumb_layout.count() >= len(starts)
+
+
+def test_every_board_image_has_the_same_size(qapp):
+    window = _review(qapp)
+    window._set_mode("board")
+    window._select_page(window.pages[0]["id"])
+    window.board.resize(500, 700)
+    window.board.grab()
+    sizes = {(rect.width(), rect.height()) for rect, _item in window.board._hits}
+    assert len(window.board._hits) == len(window.pages[0]["items"]) and len(sizes) == 1
+
+
+def test_the_wheel_zooms_the_page_images_and_back_to_fit(qapp):
+    from PySide6.QtCore import QPoint, QPointF
+    from PySide6.QtGui import QWheelEvent
+    window = _review(qapp)
+    window._select_page(window.pages[0]["id"])
+    qapp.processEvents()
+    viewport = window.thumb_area.viewport()
+
+    def wheel(notches):
+        event = QWheelEvent(QPointF(20, 20), QPointF(viewport.mapToGlobal(QPoint(20, 20))), QPoint(0, 0),
+                            QPoint(0, 120 * notches), Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+                            Qt.ScrollPhase.NoScrollPhase, False)
+        qapp.sendEvent(viewport, event)
+
+    fit = window._thumb_size(len(window._thumb_items))[0]
+    wheel(2)
+    assert window._thumb_zoom and window._thumb_zoom > fit
+    wheel(-6)
+    assert window._thumb_zoom is None
+
+
+def test_a_click_on_a_ruler_pin_selects_that_image(qapp):
+    window = _review(qapp)
+    target = window.pages[1]["items"][0]["proposal"]["frame"]
+    x = int(window.ruler._x_of(target))
+    top, height = window.ruler._track()
+    QTest.mouseClick(window.ruler, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(x, top + height // 2))
+    assert window.selected_frame == target
+    assert window.selected_page_id == window.pages[1]["id"]
+
+
+def test_the_board_zooms_and_pans(qapp):
+    from PySide6.QtCore import QPointF
+    from PySide6.QtGui import QWheelEvent
+    window = _review(qapp)
+    window._set_mode("board")
+    window._select_page(window.pages[0]["id"])
+    board = window.board
+    board.resize(500, 700)
+    centre = QPointF(250, 350)
+    board.wheelEvent(QWheelEvent(centre, centre, QPoint(0, 0), QPoint(0, 240), Qt.MouseButton.NoButton,
+                                 Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.NoScrollPhase, False))
+    assert board.zoom > 1.0
+    QTest.mousePress(board, Qt.MouseButton.MiddleButton, Qt.KeyboardModifier.NoModifier, QPoint(250, 350))
+    QTest.mouseMove(board, QPoint(300, 380))
+    QTest.mouseRelease(board, Qt.MouseButton.MiddleButton, Qt.KeyboardModifier.NoModifier, QPoint(300, 380))
+    assert board.offset.x() != 0 or board.offset.y() != 0
+
+
+def test_arrows_preview_a_suggestion_and_enter_keeps_it(qapp):
+    window = _review(qapp)
+    page = window.pages[0]
+    marker = next(item["proposal"] for item in page["items"] if not item["manual"])
+    window._choose_frame(marker["frame"], False)
+    frames = [int(frame["frame"]) for frame in window._suggestion_frames()]
+    assert len(frames) > 1
+    step = -1 if frames[-1] == marker["frame"] else 1  # towards an image that is not the kept one
+    window._browse_suggestion(step)
+    preview = window._preview
+    assert preview is not None and preview != marker["frame"]
+    assert window._proposal(marker["frame"]) is not None  # nothing kept yet
+    window._cancel_preview()
+    assert window._preview is None
+    window._browse_suggestion(step)
+    window._keep_preview()
+    assert window.selected_frame == preview
+    assert window._proposal(preview) is not None and window._proposal(marker["frame"]) is None
+    assert window._flash == preview
+
+
+def test_the_vispa_message_answers(qapp):
+    from PySide6.QtCore import QTimer
+    from vispa_mp.ui import Message
+    QTimer.singleShot(50, lambda: qapp.activeModalWidget() and qapp.activeModalWidget().accept_button.click())
+    assert Message.ask(None, "Place markers", "Place 3 markers in Resolve?", "Hand-placed markers stay.", "Place") is True

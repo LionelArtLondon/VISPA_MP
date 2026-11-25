@@ -39,7 +39,7 @@ def test_each_line_takes_the_open_mouth_and_the_end_of_the_shot_stays_blue():
     assert by_frame[10]["color"] == CORE
     assert by_frame[10]["note"] == "Line, mouth open"
     assert by_frame[90]["color"] == CORE
-    assert by_frame[90]["note"] == "Body, end of shot"
+    assert by_frame[90]["note"] == "Core, end of shot"
 
 
 def test_a_scene_opens_on_the_body_and_the_line_stays_blue():

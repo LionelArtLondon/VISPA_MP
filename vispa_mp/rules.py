@@ -220,7 +220,7 @@ def _is_group(frame, settings):
 
 def _note(kind):
     return {
-        "body": "Body, end of shot",
+        "body": "Core, end of shot",
         "speech": "Line, mouth open",
         "speech_plain": "Line",
         "speech_unverified": "Line, mouth not verified",
@@ -352,7 +352,7 @@ def _fit_story(proposals, settings, shot_count, minutes=None):
             updated["color"] = CORE
             updated["name"] = NAMES[CORE]
             updated["rule"] = "body"
-            updated["note"] = "Body"
+            updated["note"] = "Core"
         elif proposal["color"] == CORE and proposal["frame"] in chosen:
             updated["color"] = PAGE
             updated["name"] = NAMES[PAGE]

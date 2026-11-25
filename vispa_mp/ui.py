@@ -10,13 +10,13 @@ import threading
 from functools import partial
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QPoint, QRect, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPalette, QPen, QPixmap, QPolygon
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPainter, QPalette, QPen, QPixmap, QPolygon, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
     QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QSizePolicy, QSlider, QSpinBox, QStackedWidget, QTabWidget, QToolButton, QVBoxLayout,
-    QWidget, QMainWindow, QMessageBox, QFileDialog,
+    QWidget, QMainWindow, QFileDialog,
 )
 
 from shiboken6 import isValid
@@ -24,7 +24,7 @@ from shiboken6 import isValid
 from vispa_mp.analyze import analyze, refresh_utterances, saved_analysis
 from vispa_mp.client import open_client
 from vispa_mp.resolve_link import free_script_installed, link_running
-from vispa_mp.markers import EXTRA, NAMES, PAGE
+from vispa_mp.markers import CORE, EXTRA, NAMES, PAGE
 from vispa_mp.preset import SAVED_DIR, export_settings, import_settings, load, load_user, save_user
 from vispa_mp.rules import _cavity, analyzed_minutes, page_goal, propose, target_pages
 from vispa_mp.snapshot import describe_rate, normalize
@@ -39,6 +39,10 @@ from vispa_mp.window_chrome import BORDER_COLOUR, ChromeDialog, TitleBar, Window
 ICONS = Path(__file__).resolve().parent / "icons"
 LINE = "#1F4250"  # the one-pixel line between two surfaces
 THUMB_W, THUMB_H = 192, 108  # the largest 16:9 still on a page card
+# A selected card keeps its marker colour, a step brighter, in a thicker frame.
+BRIGHT = {"Green": "#6fd17d", "Blue": "#6f9bff", "Cyan": "#8be8f5", "manual": "#c3d1d6"}
+FILTERS = (("all", "All images"), ("core", "Core"), ("starts", "Page starts"))
+ZOOM_HINT = "Wheel: zoom · Wheel held down and dragged: pan"
 THUMB_MIN_W = 112  # below this the page scrolls instead of shrinking further
 CARD_TEXT = 60  # timecode, caption and margins under the still
 SWATCH = {"Green": "#3c8c4a", "Blue": "#2f6fed", "Cyan": "#3ec2d6"}
@@ -249,8 +253,8 @@ def short_note(note):
     text = (note or "").strip()
     if text.startswith("Page start"):
         return "Page start"
-    if text.startswith("Body"):
-        return "Body"
+    if text.startswith("Core") or text.startswith("Body"):
+        return "Core"
     if "not verified" in text:
         return "Mouth not verified"
     if "mouth open" in text:
@@ -367,6 +371,65 @@ class StepProgress(QWidget):
         self.show()
 
 
+def left_click_only(callback):
+    """A card's click: the left button acts, the others go to the view (wheel drag pans)."""
+    def handler(event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            callback()
+        else:
+            event.ignore()
+    return handler
+
+
+def note_caption(note):
+    """« Core · end of shot » from the rule's note « Core, end of shot »."""
+    return (note or "Marker").replace(", ", " · ", 1)
+
+
+class Message(ChromeDialog):
+    """VISPA's own question or notice: its caption, a heading, a line of detail, its buttons."""
+
+    def __init__(self, parent, title, heading, text="", accept="OK", cancel=None):
+        super().__init__(parent, title)
+        self.setModal(True)
+        self.setMinimumWidth(460)
+        self.setStyleSheet(_theme())
+        column = QVBoxLayout(self.body)
+        column.setContentsMargins(24, 20, 24, 18)
+        column.setSpacing(6)
+        head = QLabel(heading)
+        head.setObjectName("messageHeading")
+        head.setWordWrap(True)
+        column.addWidget(head)
+        if text:
+            detail = QLabel(text)
+            detail.setProperty("role", "muted")
+            detail.setWordWrap(True)
+            column.addWidget(detail)
+        column.addSpacing(18)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addStretch(1)
+        if cancel:
+            self.cancel_button = QPushButton(cancel)
+            self.cancel_button.clicked.connect(self.reject)
+            row.addWidget(self.cancel_button)
+        self.accept_button = QPushButton(accept)
+        self.accept_button.setProperty("primary", True)
+        self.accept_button.setDefault(True)
+        self.accept_button.clicked.connect(self.accept)
+        row.addWidget(self.accept_button)
+        column.addLayout(row)
+
+    @classmethod
+    def ask(cls, parent, title, heading, text, accept, cancel="Cancel"):
+        return cls(parent, title, heading, text, accept, cancel).exec() == QDialog.DialogCode.Accepted
+
+    @classmethod
+    def tell(cls, parent, title, heading, text=""):
+        cls(parent, title, heading, text).exec()
+
+
 class MarkerDot(QWidget):
     def __init__(self, color):
         super().__init__()
@@ -411,31 +474,38 @@ class PagesPanel(QWidget):
 
 
 class Ruler(QWidget):
-    """Video 1 ruler. The playhead belongs to this review, not to Resolve."""
+    """Video 1 ruler: page bands, one pin per marker in its colour, the review playhead
+    and its timecode. The playhead belongs to this review, not to Resolve."""
 
     moved = Signal(int)
+    chosen = Signal(int)
+    PAD = 12
+    PIN_REACH = 5
 
     def __init__(self):
         super().__init__()
         self.start = 0
         self.end = 1
-        self.blocks = []
+        self.markers = []
+        self.pages = []
         self.playhead = None
         self.timebase = None
         self.compact = False
         self._drag = False
-        self.setMinimumHeight(72)
+        self.setFixedHeight(84)
         self.setMouseTracking(True)
+        self.setToolTip("Click or drag: playhead · Click a pin: select that image")
 
     def set_compact(self, compact):
         self.compact = compact
-        self.setFixedHeight(36 if compact else 72)
+        self.setFixedHeight(44 if compact else 84)
         self.update()
 
-    def set_view(self, start, end, blocks, playhead, timebase):
+    def set_view(self, start, end, markers, playhead, timebase, pages=()):
         self.start = int(start)
         self.end = max(int(end), int(start) + 1)
-        self.blocks = list(blocks)
+        self.markers = [(int(frame), color) for frame, color in markers]
+        self.pages = [(int(first), int(last)) for first, last in pages]
         self.playhead = None if playhead is None else int(playhead)
         self.timebase = timebase
         self.update()
@@ -445,54 +515,102 @@ class Ruler(QWidget):
         self.update()
 
     def _x_of(self, frame):
-        pad = 12
-        width = max(1, self.width() - pad * 2)
-        return pad + (int(frame) - self.start) / (self.end - self.start) * width
+        width = max(1, self.width() - self.PAD * 2)
+        return self.PAD + (int(frame) - self.start) / (self.end - self.start) * width
 
     def _frame_at(self, x):
-        pad = 12
-        width = max(1, self.width() - pad * 2)
-        ratio = min(1.0, max(0.0, (x - pad) / width))
+        width = max(1, self.width() - self.PAD * 2)
+        ratio = min(1.0, max(0.0, (x - self.PAD) / width))
         return int(round(self.start + ratio * (self.end - self.start)))
 
+    def _pin_at(self, x):
+        near = [(abs(self._x_of(frame) - x), frame) for frame, _color in self.markers]
+        near = [item for item in near if item[0] <= self.PIN_REACH]
+        return min(near)[1] if near else None
+
+    def _track(self):
+        return (6, 12) if self.compact else (30, 20)
+
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._drag = True
-            self.moved.emit(self._frame_at(event.position().x()))
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        x = event.position().x()
+        top, height = self._track()
+        pin = self._pin_at(x) if top - 4 <= event.position().y() <= top + height + 4 else None
+        if pin is not None:
+            self.moved.emit(pin)
+            self.chosen.emit(pin)
+            return
+        self._drag = True
+        self.moved.emit(self._frame_at(x))
+        self.update()
 
     def mouseMoveEvent(self, event):
         if self._drag:
             self.moved.emit(self._frame_at(event.position().x()))
+            return
+        top, height = self._track()
+        over_pin = (self._pin_at(event.position().x()) is not None
+                    and top - 4 <= event.position().y() <= top + height + 4)
+        self.setCursor(Qt.CursorShape.PointingHandCursor if over_pin else Qt.CursorShape.ArrowCursor)
 
     def mouseReleaseEvent(self, _event):
         self._drag = False
+        self.update()
 
     def paintEvent(self, _event):
         painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.fillRect(self.rect(), QColor(PANEL_BG))
-        painter.setPen(QColor(TEXT_MUTED))
-        painter.setFont(QFont(MONO_FAMILY, 9))
-        for index in range(5):
-            frame = self.start + (self.end - self.start) * index / 4
-            x = int(self._x_of(frame))
-            painter.drawLine(x, 18 if not self.compact else 4, x, 26 if not self.compact else 10)
-            if self.timebase and not self.compact:
-                label = format_timecode(int(frame), self.timebase)
-                painter.drawText(x + 4, 16, label)
-        top = 30 if not self.compact else 14
-        height = 18 if not self.compact else 10
-        for start, end, color in self.blocks:
-            left = int(self._x_of(start))
-            right = max(left + 4, int(self._x_of(end)))
-            painter.fillRect(QRect(left, top, right - left, height), QColor(SWATCH.get(color, MANUAL_DOT)))
+        top, height = self._track()
+        if not self.compact:
+            painter.setPen(QColor(TEXT_MUTED))
+            painter.setFont(QFont(MONO_FAMILY, 9))
+            for index in range(5):
+                frame = self.start + (self.end - self.start) * index / 4
+                x = int(self._x_of(frame))
+                painter.drawLine(x, 18, x, 26)
+                if self.timebase:
+                    painter.drawText(x + 4, 16, format_timecode(int(frame), self.timebase))
+        track = QRectF(self.PAD, top, max(1, self.width() - self.PAD * 2), height)
+        painter.setPen(QPen(QColor(BORDER_ROW), 1))
+        painter.setBrush(QColor(APP_BG))
+        painter.drawRoundedRect(track, 3, 3)
+        # Pages in alternate shades, so where one ends and the next begins reads at a glance.
+        painter.setPen(Qt.PenStyle.NoPen)
+        for index, (first, last) in enumerate(self.pages):
+            left, right = self._x_of(first), max(self._x_of(first) + 1, self._x_of(last))
+            painter.setBrush(QColor("#163644" if index % 2 == 0 else "#0f2a35"))
+            painter.drawRect(QRectF(left, top + 1, right - left, height - 2))
+        for frame, color in self.markers:
+            x = self._x_of(frame)
+            shade = QColor(SWATCH.get(color, MANUAL_DOT))
+            painter.setPen(QPen(shade, 2))
+            painter.drawLine(QPointF(x, top + 2), QPointF(x, top + height - 1))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(shade)
+            painter.drawRoundedRect(QRectF(x - 3, top - 3, 6, 6), 1.5, 1.5)
         if self.playhead is None:
             return
-        x = int(self._x_of(self.playhead))
+        x = self._x_of(self.playhead)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(PLAYHEAD))
-        painter.drawPolygon(QPolygon([QPoint(x - 6, 2), QPoint(x + 6, 2), QPoint(x, 12)]))
+        head = 0 if self.compact else 2
+        painter.drawPolygon(QPolygon([QPoint(int(x) - 6, head), QPoint(int(x) + 6, head), QPoint(int(x), head + 10)]))
         painter.setPen(QPen(QColor(PLAYHEAD), 2))
-        painter.drawLine(x, 12, x, self.height() - 4)
+        painter.drawLine(QPointF(x, head + 10), QPointF(x, top + height + 2))
+        if self.timebase:
+            # The playhead's own timecode, under it, live while it is dragged.
+            label = format_timecode(self.playhead, self.timebase)
+            painter.setFont(QFont(MONO_FAMILY, 9, QFont.Weight.Bold))
+            width = painter.fontMetrics().horizontalAdvance(label) + 12
+            left = min(max(2, x - width / 2), self.width() - width - 2)
+            badge = QRectF(left, top + height + 4, width, 17)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(PLAYHEAD) if self._drag else QColor("#3a2a24"))
+            painter.drawRoundedRect(badge, 4, 4)
+            painter.setPen(QColor("#1a0d08") if self._drag else QColor(PLAYHEAD))
+            painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, label)
 
 
 class PageBoard(QWidget):
@@ -508,13 +626,49 @@ class PageBoard(QWidget):
         self.selected_manual = False
         self._hits = []
         self._pixmaps = {}
+        self.zoom = 1.0
+        self.offset = QPointF(0, 0)
+        self._pan = None
+        self.preview = ""
+        self.flash = None
+        self._shown = None
+        self.setToolTip(ZOOM_HINT)
 
     def set_page(self, items, size_mm, selected, selected_manual):
+        shown = tuple(item_frame(item) for item in items)
+        if shown != self._shown:
+            # Another page or another filter: back to the whole sheet.
+            self.zoom, self.offset, self._shown = 1.0, QPointF(0, 0), shown
         self.items = list(items)
         self.size_mm = size_mm
         self.selected = selected
         self.selected_manual = selected_manual
         self.update()
+
+    def _view_rect(self):
+        base = QRectF(self._page_rect())
+        width, height = base.width() * self.zoom, base.height() * self.zoom
+        centre = base.center() + self.offset
+        return QRectF(centre.x() - width / 2, centre.y() - height / 2, width, height)
+
+    def wheelEvent(self, event):
+        steps = event.angleDelta().y() / 120
+        if not steps or not self.items:
+            return
+        before = self._view_rect()
+        zoom = min(8.0, max(1.0, self.zoom * (1.2 ** steps)))
+        if zoom == self.zoom:
+            return
+        point = event.position()
+        share_x = (point.x() - before.x()) / max(1.0, before.width())
+        share_y = (point.y() - before.y()) / max(1.0, before.height())
+        base = QRectF(self._page_rect())
+        width, height = base.width() * zoom, base.height() * zoom
+        centre = QPointF(point.x() - share_x * width + width / 2, point.y() - share_y * height + height / 2)
+        self.zoom = zoom
+        self.offset = QPointF(0, 0) if zoom == 1.0 else centre - base.center()
+        self.update()
+        event.accept()
 
     def paintEvent(self, _event):
         painter = QPainter(self)
@@ -524,18 +678,35 @@ class PageBoard(QWidget):
             painter.setPen(QColor(TEXT_MUTED))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Read the timeline, then analyze.")
             return
-        page = self._page_rect()
+        page = self._view_rect().toRect()
         painter.fillRect(page, QColor("#f7f4ee"))
         for item, rect in self._card_rects(page):
             self._hits.append((rect, item))
             self._paint_card(painter, item, rect)
 
     def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._pan = (event.position(), QPointF(self.offset))
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
         point = event.position().toPoint()
         for rect, item in self._hits:
             if rect.contains(point):
                 self.chosen.emit(item_frame(item), item["manual"])
                 return
+
+    def mouseMoveEvent(self, event):
+        if self._pan is not None:
+            start, offset = self._pan
+            self.offset = offset + (event.position() - start)
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton and self._pan is not None:
+            self._pan = None
+            self.unsetCursor()
 
     def _page_rect(self):
         width_mm, height_mm = self.size_mm
@@ -553,38 +724,38 @@ class PageBoard(QWidget):
         return QRect(x, y, width, height)
 
     def _card_rects(self, page):
+        """Every image the same size, 16:9, in reading order: as large as the sheet allows."""
         pad, gutter = 12, 8
         inner = page.adjusted(pad, pad, -pad, -pad)
-        greens = [item for item in self.items if not item["manual"] and item["proposal"]["color"] == PAGE]
-        rest = [item for item in self.items if item not in greens]
-        cyans = [item for item in rest if not item["manual"] and item["proposal"]["color"] == EXTRA]
-        bodies = [item for item in rest if item not in cyans]
+        count = len(self.items)
+        best = None
+        for columns in range(1, count + 1):
+            rows = (count + columns - 1) // columns
+            cell_w = (inner.width() - gutter * (columns - 1)) / columns
+            cell_h = (inner.height() - gutter * (rows - 1)) / rows
+            width = min(cell_w, cell_h * 16 / 9)
+            if width > 0 and (best is None or width > best[0]):
+                best = (width, columns)
+        if best is None:
+            return []
+        width, columns = best
+        height = width * 9 / 16
+        left = inner.left() + (inner.width() - (columns * width + gutter * (columns - 1))) / 2
         rects = []
-        y = inner.top()
-        if greens:
-            height = int(inner.height() * (0.42 if rest else 0.92))
-            for item in greens:
-                rects.append((item, QRect(inner.left(), y, inner.width(), height)))
-            y += height + gutter
-        remain = max(0, inner.bottom() - y)
-        if bodies and cyans:
-            cyan_h = max(48, int(remain * 0.30))
-            body_h = max(48, remain - cyan_h - gutter)
-        elif cyans:
-            cyan_h, body_h = remain, 0
-        else:
-            body_h, cyan_h = remain, 0
-        if bodies and body_h:
-            rects.extend(_grid(bodies, inner.left(), y, inner.width(), body_h, gutter))
-            y += body_h + gutter
-        if cyans and cyan_h:
-            rects.extend(_grid(cyans, inner.left(), y, inner.width(), cyan_h, gutter))
+        for index, item in enumerate(self.items):
+            row, column = divmod(index, columns)
+            rects.append((item, QRect(int(left + column * (width + gutter)), int(inner.top() + row * (height + gutter)),
+                                      max(1, int(width)), max(1, int(height)))))
         return rects
 
     def _paint_card(self, painter, item, rect):
         color = MANUAL_DOT if item["manual"] else SWATCH.get(item["proposal"]["color"], MANUAL_DOT)
         painter.fillRect(rect, QColor("#d7d0c4"))
         path = "" if item["manual"] else (item["proposal"].get("image") or "")
+        chosen = item_frame(item) == self.selected and item["manual"] == self.selected_manual
+        previewing = chosen and bool(self.preview)
+        if previewing:
+            path = self.preview
         pixmap = self._pixmap(path)
         if pixmap is not None and not pixmap.isNull():
             scaled = pixmap.scaled(rect.size(), Qt.AspectRatioMode.KeepAspectRatioByExpanding,
@@ -598,11 +769,16 @@ class PageBoard(QWidget):
         painter.setPen(QColor("#f7f4ee"))
         painter.setFont(QFont(TEXT_FAMILY, 8))
         painter.drawText(badge.adjusted(4, 0, -4, 0), Qt.AlignmentFlag.AlignVCenter, note)
-        chosen = item_frame(item) == self.selected and item["manual"] == self.selected_manual
-        if chosen:
-            painter.setPen(QPen(QColor(ACCENT), 3))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(rect.adjusted(1, 1, -2, -2))
+        kind = "manual" if item["manual"] else item["proposal"]["color"]
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if previewing:
+            pen = QPen(QColor(ACCENT), 4, Qt.PenStyle.DashLine)
+        elif not item["manual"] and item_frame(item) == self.flash:
+            pen = QPen(QColor("#ffffff"), 5)
+        else:
+            pen = QPen(QColor(BRIGHT.get(kind, ACCENT) if chosen else color), 4 if chosen else 2)
+        painter.setPen(pen)
+        painter.drawRect(rect.adjusted(1, 1, -2, -2))
 
     def _pixmap(self, path):
         if not path:
@@ -656,7 +832,11 @@ def _theme():
     QPushButton[role="pageName"], QPushButton[role="childName"] {{ background: transparent; border: 0;
         border-radius: 0; text-align: left; padding: 0 8px; font-weight: 600; min-height: 28px; max-height: 28px; }}
     QPushButton[role="childName"] {{ font-weight: 400; }}
-    QWidget[role="pageRow"][selected="true"], QWidget[role="childRow"][selected="true"] {{ background: {SELECTED_ROW}; }}
+    QWidget#pages QWidget[role="pageRow"]:hover, QWidget#pages QWidget[role="childRow"]:hover {{
+        background: {CONTROL_BG}; }}
+    QWidget#pages QWidget[role="pageRow"][selected="true"] {{ background: {SELECTED_ROW};
+        border-left: 3px solid {ACCENT}; }}
+    QWidget#pages QWidget[role="childRow"][selected="true"] {{ background: {SELECTED_ROW}; }}
     QToolButton[role="pageArrow"] {{ background: transparent; border: 0; padding: 0; min-width: 28px;
         max-width: 28px; min-height: 28px; max-height: 28px; }}
     QPushButton[role="choice"]:checked {{ background: {SELECTED_ROW}; border-color: {ACCENT}; color: {TEXT_MAIN}; }}
@@ -666,8 +846,23 @@ def _theme():
     QPushButton#color-Green {{ background: {SWATCH['Green']}; }}
     QPushButton#color-Blue {{ background: {SWATCH['Blue']}; }}
     QPushButton#color-Cyan {{ background: {SWATCH['Cyan']}; }}
-    QFrame[role="card"] {{ background: {BAR_BG}; border: 1px solid #1F4250; border-radius: {RADIUS}px; }}
-    QFrame[role="card"][selected="true"] {{ border: 2px solid {ACCENT}; }}
+    QFrame[role="card"] {{ background: {BAR_BG}; border: 2px solid #1F4250; border-radius: {RADIUS}px; }}
+    QFrame[role="card"]:hover {{ background: {CONTROL_BG}; border-color: {BORDER_STRONG}; }}
+    QFrame[role="card"][kind="Green"] {{ border-color: {SWATCH['Green']}; }}
+    QFrame[role="card"][kind="Blue"] {{ border-color: {SWATCH['Blue']}; }}
+    QFrame[role="card"][kind="Cyan"] {{ border-color: {SWATCH['Cyan']}; }}
+    QFrame[role="card"][kind="manual"] {{ border-color: {MANUAL_DOT}; }}
+    QFrame[role="card"][kind]:hover {{ background: {CONTROL_BG}; }}
+    QFrame[role="card"][selected="true"] {{ background: {SELECTED_ROW}; border: 3px solid {ACCENT}; }}
+    QFrame[role="card"][kind="Green"][selected="true"] {{ border: 3px solid {BRIGHT['Green']}; }}
+    QFrame[role="card"][kind="Blue"][selected="true"] {{ border: 3px solid {BRIGHT['Blue']}; }}
+    QFrame[role="card"][kind="Cyan"][selected="true"] {{ border: 3px solid {BRIGHT['Cyan']}; }}
+    QFrame[role="card"][kind="manual"][selected="true"] {{ border: 3px solid {BRIGHT['manual']}; }}
+    QFrame[role="card"][state="preview"], QFrame[role="card"][kind][selected="true"][state="preview"] {{
+        background: {SELECTED_ROW}; border: 3px dashed {ACCENT}; }}
+    QFrame[role="card"][state="kept"], QFrame[role="card"][kind][selected="true"][state="kept"] {{
+        background: #24655c; border: 3px solid #ffffff; }}
+    QLabel#messageHeading {{ font-size: 15px; font-weight: 600; color: {TEXT_MAIN}; }}
     QSlider::groove:horizontal {{ height: 4px; background: #1F4250; border-radius: 2px; }}
     QSlider::handle:horizontal {{ width: 14px; margin: -6px 0; background: {ACCENT}; border-radius: 7px; }}
     QSlider::sub-page:horizontal {{ background: {PRIMARY_BG}; border-radius: 2px; }}
@@ -749,6 +944,11 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         self.worker = None
         self._stop_analysis = None
         self.mode = "strip"
+        self.view_filter = "all"
+        self._preview = None  # a suggestion shown in place of the selected image, not kept yet
+        self._flash = None  # the image just kept, framed in white for a moment
+        self._thumb_zoom = None
+        self._thumb_pan = None
         self._stored_settings, view = load_user()
         names = [name for name, _width, _height in FORMATS]
         self.page_format = view["page_format"] if view["page_format"] in names else "A5"
@@ -798,6 +998,13 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         layout.addWidget(separator())
         layout.addWidget(self._build_footer())
         self._build_settings()
+        for key, slot in ((Qt.Key.Key_Left, partial(self._browse_suggestion, -1)),
+                          (Qt.Key.Key_Right, partial(self._browse_suggestion, 1)),
+                          (Qt.Key.Key_Return, self._keep_preview), (Qt.Key.Key_Enter, self._keep_preview),
+                          (Qt.Key.Key_Escape, self._cancel_preview)):
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            shortcut.activated.connect(slot)
         self.read_button.clicked.connect(self.read_timeline)
         self.analyze_button.clicked.connect(self.run_analysis)
         self.apply_button.clicked.connect(self.write_markers)
@@ -908,7 +1115,28 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         column.addWidget(video)
         self.ruler = Ruler()
         self.ruler.moved.connect(self._on_ruler)
+        self.ruler.chosen.connect(lambda frame: self._choose_frame(frame, False))
         column.addWidget(self.ruler)
+        filters = QHBoxLayout()
+        filters.setSpacing(6)
+        filters.addWidget(self._muted("Show"))
+        self.filter_group = QButtonGroup(self)
+        self.filter_group.setExclusive(True)
+        self.filter_buttons = {}
+        for key, label in FILTERS:
+            button = QPushButton(label)
+            button.setCheckable(True)
+            button.setProperty("role", "choice")
+            button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+            button.clicked.connect(partial(self._set_filter, key))
+            self.filter_group.addButton(button)
+            self.filter_buttons[key] = button
+            filters.addWidget(button)
+        self.filter_buttons["all"].setChecked(True)
+        filters.addStretch(1)
+        hint = self._muted(ZOOM_HINT)
+        filters.addWidget(hint)
+        column.addLayout(filters)
         self.stack = QStackedWidget()
         self.stack.addWidget(self._build_strip())
         self.stack.addWidget(self._build_board())
@@ -924,7 +1152,8 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         self.thumb_area = QScrollArea()
         self.thumb_area.setFrameShape(QFrame.Shape.NoFrame)
         self.thumb_area.setWidgetResizable(True)
-        self.thumb_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.thumb_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.thumb_area.setToolTip(ZOOM_HINT)
         host = QWidget()
         self.thumb_layout = QGridLayout(host)
         self.thumb_layout.setContentsMargins(0, 0, 0, 0)
@@ -1340,7 +1569,7 @@ class MainWindow(WindowChromeMixin, QMainWindow):
             try:
                 self.save_settings_file(path)
             except OSError as error:
-                QMessageBox.warning(self.settings_dialog, "VISPA MP", f"The settings were not saved: {error}")
+                Message.tell(self.settings_dialog, "Settings", "The settings were not saved.", str(error))
 
     def _load_preset(self):
         SAVED_DIR.mkdir(parents=True, exist_ok=True)
@@ -1350,7 +1579,7 @@ class MainWindow(WindowChromeMixin, QMainWindow):
             try:
                 self.load_settings_file(path)
             except ValueError as error:
-                QMessageBox.warning(self.settings_dialog, "VISPA MP", str(error))
+                Message.tell(self.settings_dialog, "Settings", "These settings cannot be loaded.", str(error))
 
     def reset_settings(self):
         """Back to presets/default.json. The page format is a view choice and stays."""
@@ -1474,6 +1703,8 @@ class MainWindow(WindowChromeMixin, QMainWindow):
     def _make_page(self, page, warnings):
         row = QWidget()
         row.setProperty("role", "pageRow")
+        row.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        row.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         line = QHBoxLayout(row)
         line.setContentsMargins(4, 0, 8, 0)
         line.setSpacing(2)
@@ -1510,6 +1741,8 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         frame = item_frame(item)
         row = QWidget()
         row.setProperty("role", "childRow")
+        row.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        row.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         line = QHBoxLayout(row)
         line.setContentsMargins(0, 0, 0, 0)
         line.setSpacing(6)
@@ -1552,6 +1785,7 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         if page is None or not page["items"]:
             return
         item = page["items"][0]
+        self._preview = None
         self.selected_page_id = page_id
         self.selected_manual = item["manual"]
         self.selected_frame = item_frame(item)
@@ -1562,6 +1796,7 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         self._ensure_page_visible(page_id)
 
     def _select_child(self, page_id, frame, manual):
+        self._preview = None
         self.selected_page_id = page_id
         self.selected_frame = int(frame)
         self.selected_manual = bool(manual)
@@ -1633,21 +1868,53 @@ class MainWindow(WindowChromeMixin, QMainWindow):
 
     def _refresh_ruler(self):
         start, end = self._span()
-        ordered = sorted(self.proposals, key=lambda item: int(item["frame"]))
-        blocks = []
-        for index, proposal in enumerate(ordered):
-            frame = int(proposal["frame"])
-            nxt = int(ordered[index + 1]["frame"]) if index + 1 < len(ordered) else frame + 1
-            blocks.append((frame, max(nxt, frame + 1), proposal["color"]))
-        self.ruler.set_view(start, end, blocks, self.playhead_frame, self._timebase())
+        markers = [(int(item["frame"]), item["color"]) for item in self.proposals]
+        firsts = [item_frame(page["items"][0]) for page in self.pages if page["items"]]
+        spans = [(first, firsts[index + 1] if index + 1 < len(firsts) else end) for index, first in enumerate(firsts)]
+        self.ruler.set_view(start, end, markers, self.playhead_frame, self._timebase(), spans)
+
+    def _set_filter(self, key):
+        if key == self.view_filter:
+            return
+        self.view_filter = key
+        self.filter_buttons[key].setChecked(True)
+        self._refresh_thumbs()
+        self._refresh_board()
+
+    def _view_items(self):
+        """What Strip and Board show: the page, its Core images only, or every page start."""
+        if self.view_filter == "starts":
+            starts = []
+            for page in self.pages:
+                greens = [item for item in page["items"] if not item["manual"] and item["proposal"]["color"] == PAGE]
+                if greens:
+                    starts.append(greens[0])
+            return starts
+        page = self._page(self.selected_page_id) if self.selected_page_id is not None else None
+        if page is None:
+            return None
+        items = list(page["items"])
+        if self.view_filter == "core":
+            items = [item for item in items if not item["manual"] and item["proposal"]["color"] in (PAGE, CORE)]
+        return items
 
     def _refresh_thumbs(self):
-        page = self._page(self.selected_page_id) if self.selected_page_id is not None else None
-        self._thumb_items = None if page is None else list(page["items"])
+        self._thumb_items = self._view_items()
         self._thumb_fit = None
         self._place_thumbs()
 
+    def _fit_still(self, count):
+        return self._thumb_fit_size(count)[0]
+
     def _thumb_size(self, count):
+        """The card width and columns: the wheel's zoom when set, otherwise the largest that fits."""
+        if self._thumb_zoom:
+            gap = self.thumb_layout.spacing()
+            width = max(1, self.thumb_area.viewport().width())
+            return self._thumb_zoom, max(1, (width + gap) // (self._thumb_zoom + 12 + gap))
+        return self._thumb_fit_size(count)
+
+    def _thumb_fit_size(self, count):
         """The largest card width that shows ``count`` cards in the visible area, and its columns."""
         gap = self.thumb_layout.spacing()
         width = max(1, self.thumb_area.viewport().width())
@@ -1672,7 +1939,8 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         for index in range(self.thumb_layout.rowCount() + 1):
             self.thumb_layout.setRowStretch(index, 0)
         if not items:
-            self.thumb_layout.addWidget(self._muted("No page yet."), 0, 0)
+            empty = "No page yet." if items is None else "No image of this kind on this page."
+            self.thumb_layout.addWidget(self._muted(empty), 0, 0)
             self.thumb_layout.setColumnStretch(1, 1)
             self.thumb_layout.setRowStretch(1, 1)
             return
@@ -1683,11 +1951,44 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         self.thumb_layout.setColumnStretch(columns, 1)
         self.thumb_layout.setRowStretch((len(items) + columns - 1) // columns, 1)
 
+    def _zoom_thumbs(self, steps):
+        items = self._thumb_items or []
+        if not items or not steps:
+            return
+        fit = self._fit_still(len(items))
+        current = self._thumb_zoom or fit
+        wanted = int(round(current * (1.15 ** steps) / 8) * 8)
+        wanted = min(720, max(80, wanted))
+        # Zooming back out to the fitted size returns to « everything in view ».
+        self._thumb_zoom = None if steps < 0 and wanted <= fit else wanted
+        self._thumb_fit = None
+        self._place_thumbs()
+
     def eventFilter(self, watched, event):
         area = getattr(self, "thumb_area", None)
-        if (event.type() == QEvent.Type.Resize and area is not None and isValid(area)
-                and watched is area.viewport()):
+        if area is None or not isValid(area) or watched is not area.viewport():
+            return super().eventFilter(watched, event)
+        kind = event.type()
+        if kind == QEvent.Type.Resize:
             self._place_thumbs()
+        elif kind == QEvent.Type.Wheel:
+            self._zoom_thumbs(event.angleDelta().y() / 120)
+            return True
+        elif kind == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.MiddleButton:
+            self._thumb_pan = (event.globalPosition(), area.horizontalScrollBar().value(),
+                               area.verticalScrollBar().value())
+            area.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+            return True
+        elif kind == QEvent.Type.MouseMove and self._thumb_pan is not None:
+            start, left, top = self._thumb_pan
+            moved = event.globalPosition() - start
+            area.horizontalScrollBar().setValue(int(left - moved.x()))
+            area.verticalScrollBar().setValue(int(top - moved.y()))
+            return True
+        elif kind == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.MiddleButton:
+            self._thumb_pan = None
+            area.viewport().unsetCursor()
+            return True
         return super().eventFilter(watched, event)
 
     def _thumb(self, item, still=THUMB_W):
@@ -1695,6 +1996,8 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         high = still * 9 // 16
         card = QFrame()
         card.setProperty("role", "card")
+        card.setProperty("kind", "manual" if item["manual"] else item["proposal"]["color"])
+        card.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
         card.setFixedSize(still + 12, high + CARD_TEXT)
         chosen = frame == self.selected_frame and item["manual"] == self.selected_manual
         card.setProperty("selected", "true" if chosen else "false")
@@ -1705,20 +2008,27 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         picture.setFixedSize(still, high)
         picture.setAlignment(Qt.AlignmentFlag.AlignCenter)
         path = "" if item["manual"] else (item["proposal"].get("image") or "")
+        state = ""
+        if chosen and self._preview is not None:
+            path, state = self._preview_image() or path, "preview"
+        elif not item["manual"] and frame == self._flash:
+            state = "kept"
+        card.setProperty("state", state)
         color = MANUAL_DOT if item["manual"] else SWATCH.get(item["proposal"]["color"], MANUAL_DOT)
         picture.setPixmap(self._scaled(path, still, high, color))
         column.addWidget(picture)
         timecode = QLabel(self.timecode_of(frame))
         timecode.setProperty("role", "mono")
         column.addWidget(timecode)
-        if item["manual"]:
-            caption = "manual · kept"
-        else:
-            caption = f"{COLOR_LABEL.get(item['proposal']['color'], '')} · {short_note(item['proposal'].get('note'))}"
+        caption = "Manual · kept" if item["manual"] else note_caption(item["proposal"].get("note"))
+        if state == "preview":
+            caption = "Preview · Enter keeps it"
+        elif state == "kept":
+            caption = "Kept"
         text = QLabel(caption)
         text.setProperty("role", "muted")
         column.addWidget(text)
-        card.mousePressEvent = lambda _event, frame=frame, manual=item["manual"]: self._choose_frame(frame, manual)
+        card.mousePressEvent = left_click_only(partial(self._choose_frame, frame, item["manual"]))
         return card
 
     def _scaled(self, path, width, height, fallback):
@@ -1737,6 +2047,7 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         return cache[key]
 
     def _refresh_suggestions(self):
+        self._suggestion_cards = {}
         self._clear_layout(self.suggestion_layout)
         frames = self._suggestion_frames()
         if not frames:
@@ -1775,6 +2086,8 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         card.setFixedSize(104, 112)
         chosen = int(frame["frame"]) == self.selected_frame
         card.setProperty("selected", "true" if chosen else "false")
+        card.setProperty("state", "preview" if int(frame["frame"]) == self._preview else "")
+        self.__dict__.setdefault("_suggestion_cards", {})[int(frame["frame"])] = card
         column = QVBoxLayout(card)
         column.setContentsMargins(6, 6, 6, 6)
         picture = QLabel()
@@ -1787,8 +2100,50 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         label.setProperty("role", "muted")
         column.addWidget(label)
         number = int(frame["frame"])
-        card.mousePressEvent = lambda _event, number=number: self._use_suggestion(number)
+        card.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        card.mousePressEvent = left_click_only(partial(self._use_suggestion, number))
         return card
+
+    def _browse_suggestion(self, step):
+        """Left / Right: show the next suggestion in place of the selected image, without keeping it."""
+        if self.selected_manual or self.selected_frame is None:
+            return
+        frames = [int(frame["frame"]) for frame in self._suggestion_frames()]
+        if not frames:
+            return
+        current = self._preview if self._preview is not None else self.selected_frame
+        index = frames.index(current) if current in frames else (-1 if step > 0 else len(frames))
+        index = max(0, min(len(frames) - 1, index + step))
+        self._preview = None if frames[index] == self.selected_frame else frames[index]
+        self._refresh_center()
+        card = getattr(self, "_suggestion_cards", {}).get(frames[index])
+        if card is not None:
+            self.suggestion_area.ensureWidgetVisible(card)
+        if self._preview is None:
+            self.status.setText("This is the image already kept.")
+        else:
+            self.status.setText(f"Preview {self.timecode_of(self._preview)} · Enter keeps it · Esc goes back")
+
+    def _keep_preview(self):
+        if self._preview is not None:
+            number, self._preview = self._preview, None
+            self._use_suggestion(number)
+
+    def _cancel_preview(self):
+        if self._preview is not None:
+            self._preview = None
+            self._refresh_center()
+            self.status.setText("Back to the image already kept.")
+
+    def _end_flash(self):
+        self._flash = None
+        self._refresh_center()
+
+    def _preview_image(self):
+        for frame in self._suggestion_frames() if self._preview is not None else []:
+            if int(frame["frame"]) == self._preview:
+                return frame.get("image") or ""
+        return ""
 
     def _use_suggestion(self, frame_number):
         proposal = None if self.selected_manual else self._proposal(self.selected_frame)
@@ -1810,15 +2165,27 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         proposal["teeth"] = round(float(source.get("teeth") or 0), 4)
         proposal["sharpness"] = round(float(source.get("sharpness") or 0), 3)
         proposal["cavity"] = round(_cavity(source), 4)
+        before = self.selected_frame
         self.selected_frame = int(frame_number)
         self.selected_manual = False
+        self._preview = None
+        self._flash = int(frame_number)
         self._fill()
+        self.status.setText(f"Image kept: {self.timecode_of(before)} → {self.timecode_of(frame_number)}.")
+        QTimer.singleShot(700, self._end_flash)
 
     def _refresh_board(self):
         page = self._page(self.selected_page_id) if self.selected_page_id is not None else None
-        items = page["items"] if page else []
+        items = self._view_items() or []
+        self.board.preview = self._preview_image() if self._preview is not None else ""
+        self.board.flash = self._flash
         self.board.set_page(items, self._oriented_size(), self.selected_frame, self.selected_manual)
-        self.caption.setText(self._caption(page))
+        caption = self._caption(page)
+        if self.view_filter == "starts":
+            caption = f"Page starts · {self._count(len(items), 'page')}."
+        elif self.view_filter == "core" and caption:
+            caption = caption[:-1] + " · Core images."
+        self.caption.setText(caption)
 
     def _caption(self, page):
         if page is None:
@@ -2000,6 +2367,16 @@ class MainWindow(WindowChromeMixin, QMainWindow):
             return ""
         return f"In/Out range  {self.timecode_of(span[0])} – {self.timecode_of(span[1])}"
 
+    def resolve_payload(self):
+        """The payload in Resolve's marker units: frames counted from the timeline start."""
+        payload = self.apply_payload()
+        offset = int((self.snapshot or {}).get("start_frame") or 0)
+        payload["proposals"] = [dict(item, frame=int(item["frame"]) - offset) for item in payload["proposals"]]
+        for key in ("start", "end"):
+            if payload[key] is not None:
+                payload[key] = int(payload[key]) - offset
+        return payload
+
     def apply_payload(self):
         start = end = None
         if self.analysis and self.analysis.get("range") and self.settings().get("use_in_out"):
@@ -2035,7 +2412,7 @@ class MainWindow(WindowChromeMixin, QMainWindow):
 
     def _failed(self, message):
         self.status.setText(message)
-        QMessageBox.warning(self, "VISPA MP", message)
+        Message.tell(self, "VISPA MP", "Something went wrong.", message)
 
     def _cache_dir(self):
         return Path(__file__).resolve().parents[1] / "cache"
@@ -2124,12 +2501,14 @@ class MainWindow(WindowChromeMixin, QMainWindow):
             self.status.setText("Resolve is not connected.")
             return
         count = len(self.proposals)
-        answer = QMessageBox.question(
-            self, "Markers",
-            f"Place {count} markers in Resolve? Hand-placed markers stay.")
-        if answer != QMessageBox.StandardButton.Yes:
+        span = (self.analysis or {}).get("range")
+        where = "in the In/Out range" if span and self.settings().get("use_in_out") else "on the whole timeline"
+        if not Message.ask(
+                self, "Place markers", f"Place {self._count(count, 'marker')} in Resolve?",
+                f"VISPA MP replaces only its own markers {where}. Markers you placed by hand stay.",
+                f"Place {self._count(count, 'marker')}"):
             return
-        payload = self.apply_payload()
+        payload = self.resolve_payload()
         self.status.setText(self._resolve_wait_text("Placing markers…"))
         found = []
 
@@ -2142,10 +2521,11 @@ class MainWindow(WindowChromeMixin, QMainWindow):
             if found:
                 self.client = found[0]
             self._sync_resolve()
-            self.status.setText(
-                f"{len(result.get('placed') or [])} placed, "
-                f"{len(result.get('skipped') or [])} left (a hand-placed marker is already there)."
-            )
+            placed, left = len(result.get("placed") or []), len(result.get("skipped") or [])
+            text = f"{self._count(placed, 'marker')} placed in Resolve."
+            if left:
+                text += f" {left} not placed: a hand-placed marker is there, or Resolve refused the position."
+            self.status.setText(text)
 
         self._start(work, done)
 

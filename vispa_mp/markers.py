@@ -9,7 +9,7 @@ CORE = "Blue"
 EXTRA = "Cyan"
 AUTOMATIC = "vispa-mp"
 
-NAMES = {PAGE: "Page", CORE: "Body", EXTRA: "Extra"}
+NAMES = {PAGE: "Page", CORE: "Core", EXTRA: "Extra"}
 
 
 def is_automatic(custom_data):

@@ -206,7 +206,8 @@ class WindowChromeMixin:
             self._native_frame_ready = True
             self._native_hwnd = int(self.winId())
             self._add_native_frame(frame_changed=False)
-            self._rounded_native = round_and_outline(self)
+            # A window may set outline_colour to its own accent; VISPA MP keeps the teal.
+            self._rounded_native = round_and_outline(self, getattr(self, "outline_colour", BORDER_COLOUR))
             user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x0027)
             if self._screen_window is not self.windowHandle():
                 self._screen_window = self.windowHandle()

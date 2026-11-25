@@ -78,5 +78,9 @@ def normalize(snapshot):
             warnings.append(
                 f"Video 1 runs at {rate:g} fps and the timeline at {shown:g}: Resolve repeats or skips "
                 "pictures, so a marker can land on a picture that is not in the file.")
+    # Resolve counts a marker from the timeline's first frame (0), like the Cue exporter
+    # does. VISPA MP works in timeline frames, the same as clips, In and Out.
+    start = int(result.get("start_frame") or 0)
+    result["markers"] = [dict(marker, frame=int(marker["frame"]) + start) for marker in result.get("markers") or []]
     result["warnings"] = warnings
     return result

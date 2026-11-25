@@ -50,3 +50,18 @@ def test_a_real_mismatch_and_an_old_script_are_told():
     assert OLD_SCRIPT in normalize(old)["warnings"]
     assert not any("runs at" in line for line in normalize(old)["warnings"])
     assert normalize(old)["timecode_fps"] == 50
+
+
+def test_markers_come_back_in_timeline_frames_and_go_out_as_offsets(qapp):
+    # Resolve counts a marker from the timeline's first frame: 8822 after a start at 180000.
+    snapshot = normalize(dict(INTERLACED, markers=[{"frame": 8822, "automatic": False}]))
+    assert snapshot["markers"][0]["frame"] == 188822
+    from vispa_mp.ui import MainWindow
+    window = MainWindow(client=None)
+    window.snapshot = snapshot
+    window.proposals = [{"frame": 188900, "color": "Green"}]
+    window.analysis = {"range": [188822, 199480]}
+    window.set_setting("use_in_out", True)
+    payload = window.resolve_payload()
+    assert payload["proposals"] == [{"frame": 8900, "color": "Green"}]
+    assert (payload["start"], payload["end"]) == (8822, 19480)
