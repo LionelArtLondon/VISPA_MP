@@ -32,11 +32,32 @@ def model_id(model_path):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def providers():
+def providers(gpu=True):
+    """The graphics card first when it helps. Silero passes gpu=False: it calls the
+    model every 32 ms of sound, and on the RTX those small calls ran 11 times slower."""
     import onnxruntime as ort
     available = ort.get_available_providers()
-    chosen = [name for name in ("CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider") if name in available]
+    wanted = ("CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider") if gpu else ("CPUExecutionProvider",)
+    chosen = [name for name in wanted if name in available]
     return chosen or available
+
+
+def session_options():
+    """DirectML needs these two: no memory pattern, one node at a time."""
+    import onnxruntime as ort
+    options = ort.SessionOptions()
+    options.enable_mem_pattern = False
+    options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    return options
+
+
+def device_name(session):
+    used = session.get_providers()
+    if used and used[0] == "DmlExecutionProvider":
+        return "graphics card (DirectML)"
+    if used and used[0] == "CUDAExecutionProvider":
+        return "graphics card (CUDA)"
+    return "processor"
 
 
 def features_from_probs(probs):
@@ -72,7 +93,8 @@ def _sigmoid(values):
 class Tagger:
     def __init__(self, model_path, labels_path):
         import onnxruntime as ort
-        self.session = ort.InferenceSession(str(model_path), providers=providers())
+        self.session = ort.InferenceSession(str(model_path), session_options(), providers=providers())
+        self.device = device_name(self.session)
         self.input = self.session.get_inputs()[0]
         self.labels = _labels(labels_path)
         shape = self.input.shape

@@ -1,5 +1,6 @@
 numpy
 pillow
-onnxruntime
+# DirectML runs the tagger on the graphics card (DirectX 12), with no CUDA install.
+onnxruntime-directml
 PySide6
 pytest

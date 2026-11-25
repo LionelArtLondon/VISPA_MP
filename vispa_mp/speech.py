@@ -77,7 +77,7 @@ class Silero:
     def __init__(self, path):
         import onnxruntime as ort
         from vispa_mp.tags import providers
-        self.session = ort.InferenceSession(str(path), providers=providers())
+        self.session = ort.InferenceSession(str(path), providers=providers(gpu=False))
         self._prob_name, self._state_name = _io_names(self.session)
         self.reset()
 

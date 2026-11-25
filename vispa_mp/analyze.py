@@ -109,6 +109,7 @@ class Live:
         self.progress(f"Loading the recognition model{aside}")
         if self.tagger is None:
             self.tagger = Tagger(*self.wd_files)
+        aside = f" on the {getattr(self.tagger, 'device', 'processor')}{aside}"
         started = time.monotonic()
         for index, frame in enumerate(todo, 1):
             if self.cancel is not None and self.cancel():

@@ -64,6 +64,25 @@ C'est bon quand on change Mouth et le format, qu'on ferme et rouvre l'app, et qu
 
 Cible à vérifier par mesure : le tagueur passe de 3,2 s à moins de 0,1 s par image, et un épisode de 24 min s'analyse en 10 à 20 minutes, dont l'essentiel en lecture vidéo.
 
+### Fait le 25 novembre 2026 — ce que les mesures ont décidé
+
+Mesures sur la RTX 3080, onnxruntime-directml 1.24.4, vidéo de test 1080p H.264 de 3 minutes :
+
+| Essai | Résultat | Décision |
+|---|---|---|
+| Tagueur, processeur | 3 200 ms par image | — |
+| Tagueur, DirectML, une image | **117 ms par image**, scores identiques au processeur (écart 3·10⁻⁶) | gardé |
+| Tagueur, DirectML, lots de 4, 8, 16 | 147 à 158 ms par image | abandonné : plus lent |
+| Silero, DirectML / processeur | 3,5 s / 0,3 s par minute d'audio | Silero reste sur le processeur |
+| Bande 64×36, processeur / d3d11va / cuda | 3,6 s / 7,0 s / 5,9 s | décodage matériel abandonné |
+| Préparation d'une image pour le tagueur | 2 ms | pas besoin d'un fil à part |
+
+- `requirements.txt` demande `onnxruntime-directml`. `Silero` demande le processeur, le tagueur la carte graphique, et la progression dit lequel tourne (« Recognizing 120/3100 on the graphics card (DirectML) · about 6 min left »).
+- **Lecture limitée à la zone : pas faite.** La bande d'un épisode entier se lit en 30 s environ et reste en cache par clip : seul le premier essai la paie. Le gain ne justifie pas le risque d'un décalage d'image avec `-ss`.
+- `onnxruntime-gpu` (CUDA) n'est pas essayé : DirectML atteint déjà la cible.
+
+Estimation pour 24 minutes, par extrapolation des mesures : bande 30 s, coupes 30 s, son et parole 20 s, extraction des images 1 min, reconnaissance de 3 000 images 6 min. Soit **8 à 10 minutes** la première fois, et quelques secondes ensuite grâce au cache.
+
 ## Étape 3 — Qualité, mesurée
 
 - **Jeu de référence.** 30 images d'un épisode, notées à la main (bouche ouverte, fermée, cachée ; nette ou floue). Un script donne le taux de bonnes réponses. Toute modification du tagueur, du cadrage ou des seuils se juge sur ce chiffre.

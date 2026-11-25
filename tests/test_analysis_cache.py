@@ -204,3 +204,13 @@ def test_the_analyze_button_becomes_cancel_while_it_runs(qapp, monkeypatch):
     qapp.processEvents()
     assert window.analyze_button.text() == "Analyze"
     assert "Analysis stopped" in window.status.text()
+
+
+def test_silero_stays_on_the_processor(monkeypatch):
+    import onnxruntime
+
+    from vispa_mp.tags import providers
+    monkeypatch.setattr(onnxruntime, "get_available_providers",
+                        lambda: ["DmlExecutionProvider", "CPUExecutionProvider"])
+    assert providers() == ["DmlExecutionProvider", "CPUExecutionProvider"]
+    assert providers(gpu=False) == ["CPUExecutionProvider"]
