@@ -45,12 +45,19 @@ def _drop_to_frames(hours, minutes, seconds, frames, rate):
 
 
 def format_timecode(frame, timebase):
-    """The display timecode of one timeline frame."""
+    """The display timecode of one timeline frame.
+
+    ``timecode_fps`` is the rate Resolve's timecode counts. On an interlaced
+    timeline it is half of ``fps``: two timeline units (fields) per picture.
+    """
     fps = float(timebase["fps"])
-    rate = nominal_fps(fps)
-    origin, origin_drop = parse_timecode(timebase.get("start_timecode") or "00:00:00:00", fps)
+    shown = float(timebase.get("timecode_fps") or fps)
+    per_picture = fps / shown if shown > 0 else 1.0
+    rate = nominal_fps(shown)
+    origin, origin_drop = parse_timecode(timebase.get("start_timecode") or "00:00:00:00", shown)
     drop = bool(timebase.get("drop", origin_drop))
-    absolute = origin + int(frame) - int(timebase.get("start_frame") or 0)
+    offset = int(frame) - int(timebase.get("start_frame") or 0)
+    absolute = origin + int(offset // per_picture)
     if absolute < 0:
         absolute = 0
     separator = ";" if drop else ":"

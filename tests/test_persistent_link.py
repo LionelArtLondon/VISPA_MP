@@ -208,7 +208,9 @@ def test_the_lua_script_listens_until_told_to_stop(tmp_path, sandbox, menu):
         client = MailboxClient(link, timeout=15)
         assert client.ping() == {"ok": True}
         assert link.pending_request() is None
-        assert client.read()["timeline_name"] == "Episode"
+        first = client.read()
+        assert first["timeline_name"] == "Episode"
+        assert first["script_version"] == 2 and first["interlaced"] is False
         placed = client.apply([{"frame": 12, "color": "Green"}], 0, 100)
         assert placed["placed"] == [12]
         assert [m["frame"] for m in client.read()["markers"]] == [12]

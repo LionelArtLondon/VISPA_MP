@@ -6,3 +6,4 @@ models/
 tools/
 *.pyc
 presets/user.json
+presets/saved/

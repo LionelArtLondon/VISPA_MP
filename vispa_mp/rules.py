@@ -19,6 +19,12 @@ def mark_holds(frames, ratio):
     return frames
 
 
+def gap_frames(settings, key):
+    """A gap set in seconds, as frames of the analyzed timeline (24 fps when unknown)."""
+    fps = float((settings or {}).get("_fps") or 24)
+    return max(0, int(round(float(setting(settings, key)) * fps)))
+
+
 def _number(frame, key):
     value = frame.get(key)
     return 0.0 if value is None else float(value)
@@ -180,7 +186,7 @@ def _spread(frames, shot, count, taken, settings, cores, best):
     points = [shot["start"] + (index + 1) * (shot["end"] - shot["start"]) / (count + 1) for index in range(count)]
     chosen, used = [], set(taken)
     limit = float(setting(settings, "duplicate_diff"))
-    minimum = int(setting(settings, "min_marker_frames"))
+    minimum = gap_frames(settings, "min_marker_seconds")
     for point in points:
         pool = []
         for frame in holds:
@@ -251,22 +257,42 @@ def _proposal(frame, color, kind, note, strength=0):
     }
 
 
-def page_goal(settings):
+def page_goal(settings, minutes=None):
     """Pages asked for by the slider, before the shot count limits it.
 
-    Low (0) is the high end of the range. High (1) is the low end.
+    Low (0) is the high end of the range. High (1) is the low end. The range is
+    for an episode of ``episode_minutes``; ``minutes`` analyzed get their share.
     """
     low = max(1, int(setting(settings, "target_pages_min")))
     high = max(1, int(setting(settings, "target_pages_max")))
     if low > high:
         low, high = high, low
     compression = min(1.0, max(0.0, float(setting(settings, "compression"))))
-    return max(1, int(round(high - compression * (high - low))))
+    goal = high - compression * (high - low)
+    episode = float(setting(settings, "episode_minutes") or 0)
+    if minutes and episode > 0:
+        goal *= float(minutes) / episode
+    return max(1, int(round(goal)))
 
 
-def target_pages(settings, shot_count):
+def target_pages(settings, shot_count, minutes=None):
     """How many page opens to keep. Never more than one per shot."""
-    return max(1, min(page_goal(settings), max(1, int(shot_count or 1))))
+    return max(1, min(page_goal(settings, minutes), max(1, int(shot_count or 1))))
+
+
+def analyzed_minutes(analysis):
+    """Length of what was analyzed: the In/Out range, or the span of its shots."""
+    fps = float(analysis.get("fps") or 0)
+    if fps <= 0:
+        return None
+    span = analysis.get("range")
+    if not span:
+        shots = analysis.get("shots") or []
+        if not shots:
+            return None
+        span = (min(int(shot["start"]) for shot in shots), max(int(shot["end"]) for shot in shots))
+    frames = int(span[1]) - int(span[0])
+    return frames / fps / 60 if frames > 0 else None
 
 
 _DROP = {"action": 0, "speech_extra": 1, "speech_unverified": 2, "speech_plain": 3, "speech": 4, "body": 5, "page": 9}
@@ -290,13 +316,13 @@ def _pages(proposals):
     return pages
 
 
-def _fit_story(proposals, settings, shot_count):
+def _fit_story(proposals, settings, shot_count, minutes=None):
     """Keep about as many page opens as the compression slider asks for."""
     greens = [proposal for proposal in proposals if proposal["color"] == PAGE]
     if len(greens) < 1:
         return proposals, []
-    target = target_pages(settings, shot_count)
-    gap = int(setting(settings, "min_green_frames"))
+    target = target_pages(settings, shot_count, minutes)
+    gap = gap_frames(settings, "min_green_seconds")
     chosen = {greens[0]["frame"]}
     pool = [proposal["frame"] for proposal in greens[1:]]
     while len(chosen) < target and pool and len(chosen) < len(greens):
@@ -367,11 +393,11 @@ def _trim_pages(proposals, settings):
         core_count = len(cores())
         if core_count < core_min or len(kept) < total_min:
             warnings.append(
-                f"Page at frame {kept[0]['frame']}: {core_count} body images, {len(kept)} images, under the floor."
+                f"Page at frame {kept[0]['frame']}: {core_count} Core images, {len(kept)} in all, below the minimum."
             )
         elif core_count > core_max or len(kept) > total_max:
             warnings.append(
-                f"Page at frame {kept[0]['frame']}: the floor keeps the page above the ceiling."
+                f"Page at frame {kept[0]['frame']}: the minimum keeps the page above the maximum."
             )
         kept_pages.extend(kept)
     return kept_pages, warnings
@@ -380,13 +406,15 @@ def _trim_pages(proposals, settings):
 def propose(analysis, settings):
     """Proposals and warnings. Does not read video, audio, or a model."""
     fps = float(analysis.get("fps") or 24)
+    settings = dict(settings or {})
+    settings["_fps"] = fps  # gaps in seconds become frames of this timeline
     manual = [int(frame) for frame in analysis.get("manual_frames") or []]
     utterances = sorted(analysis.get("utterances") or [], key=lambda item: item["start"])
     proposals = []
     warnings = []
     last_green = None
-    minimum = int(setting(settings, "min_marker_frames"))
-    green_gap = int(setting(settings, "min_green_frames"))
+    minimum = gap_frames(settings, "min_marker_seconds")
+    green_gap = gap_frames(settings, "min_green_seconds")
     for shot in analysis.get("shots") or []:
         if setting(settings, "skip_marked_shots") and any(shot["start"] <= frame < shot["end"] for frame in manual):
             continue
@@ -460,7 +488,8 @@ def propose(analysis, settings):
         if current is None or rank[proposal["color"]] < rank[current["color"]]:
             collapsed[proposal["frame"]] = proposal
     ordered = [collapsed[key] for key in sorted(collapsed)]
-    ordered, fit_warnings = _fit_story(ordered, settings, len(analysis.get("shots") or []))
+    ordered, fit_warnings = _fit_story(ordered, settings, len(analysis.get("shots") or []),
+                                       analyzed_minutes(analysis))
     ordered, trim_warnings = _trim_pages(ordered, settings)
     warnings.extend(fit_warnings)
     warnings.extend(trim_warnings)
@@ -474,7 +503,7 @@ def _second_mouth(frames, utterance, first, settings, best, taken, manual):
     opens = _sharp_enough(_with_interior(opens), settings)
     if not opens:
         return None
-    minimum = int(setting(settings, "min_marker_frames"))
+    minimum = gap_frames(settings, "min_marker_seconds")
     middle = (utterance["start"] + utterance["end"]) / 2
     first_score = _cavity(first) + _number(first, "teeth")
     ratio = float(setting(settings, "second_mouth_ratio"))

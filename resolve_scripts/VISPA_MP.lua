@@ -6,6 +6,8 @@
 
 local MAILBOX = [[__MAILBOX__]]
 local AUTOMATIC = "vispa-mp"
+-- VISPA MP asks for this version: an older copy still running in Resolve is told to restart.
+local SCRIPT_VERSION = 2
 local POLL_SECONDS = 0.25
 local STALE_SECONDS = 300
 local STARTED = os.time()
@@ -345,6 +347,9 @@ local function read_timeline(timeline)
   local setting = call(timeline, "GetSetting", "timelineFrameRate")
   local fps = parse_fps(setting) or 24
   local drop_raw = trim(call(timeline, "GetSetting", "timelineDropFrameTimecode")):lower()
+  -- An interlaced timeline counts fields (50 for 25i) while its timecode counts images.
+  local interlace_raw = trim(call(timeline, "GetSetting", "timelineInterlaceProcessing")):lower()
+  local playback_fps = parse_fps(call(timeline, "GetSetting", "timelinePlaybackFrameRate"))
   local names = track_names(timeline, "video")
   local marks = call(timeline, "GetMarkInOut") or {}
   local video_marks = type(marks) == "table" and marks.video or {}
@@ -363,6 +368,8 @@ local function read_timeline(timeline)
     end_frame = math.floor(tonumber(call(timeline, "GetEndFrame")) or 0),
     fps = fps,
     drop = drop_raw == "1" or drop_raw == "true",
+    interlaced = interlace_raw == "1" or interlace_raw == "true",
+    script_version = SCRIPT_VERSION,
     start_timecode = call(timeline, "GetStartTimecode") or "00:00:00:00",
     video_track_name = names[1] or "",
     video_clips = video,
@@ -370,6 +377,7 @@ local function read_timeline(timeline)
     markers = markers_of(timeline),
     warnings = array(warnings),
   }
+  if playback_fps ~= nil then result.playback_fps = playback_fps end
   local mark_in = absolute_mark(video_marks["in"], start_frame)
   local mark_out = absolute_mark(video_marks["out"], start_frame)
   if mark_in ~= nil then result.mark_in = mark_in end

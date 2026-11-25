@@ -89,11 +89,11 @@ def test_a_speaking_pose_needs_the_mouth_interior_and_then_the_teeth():
     interior = frame(24, sharpness=50, open_mouth=0.9, closed_mouth=0.03, tongue=0.55, teeth=0.08)
     with_teeth = frame(36, sharpness=70, open_mouth=0.84, closed_mouth=0.04, tongue=0.4, teeth=0.82)
     result = propose(analysis([shot(0, 80, [teeth_only, interior])], utterances=[{"start": 0, "end": 50}]),
-                     settings(min_marker_frames=8))
+                     settings(min_marker_seconds=8 / 24))
     speech = [item for item in result["proposals"] if item["note"] == "Line, mouth open"]
     assert [item["frame"] for item in speech] == [24]
     both = propose(analysis([shot(0, 80, [interior, with_teeth])], utterances=[{"start": 0, "end": 50}]),
-                   settings(min_marker_frames=8))
+                   settings(min_marker_seconds=8 / 24))
     speech = [item for item in both["proposals"] if item["note"] == "Line, mouth open"]
     assert [item["frame"] for item in speech] == [36]
 
@@ -109,7 +109,7 @@ def test_cycle_frame_is_used_when_every_hold_has_the_mouth_closed():
 def test_action_extras_are_cyan_and_a_duplicate_of_the_body_is_dropped():
     frames = [frame(2, signature=[1, 1, 1, 1]), frame(12, signature=[9, 9, 9, 9]),
               frame(22, signature=[1, 1, 1, 1])]
-    result = propose(analysis([shot(0, 24, frames, motion=30)]), settings(action_extras=2, min_marker_frames=4))
+    result = propose(analysis([shot(0, 24, frames, motion=30)]), settings(action_extras=2, min_marker_seconds=4 / 24))
     colours = [(item["frame"], item["color"]) for item in result["proposals"]]
     assert (22, CORE) in colours
     assert (12, EXTRA) in colours
@@ -119,8 +119,8 @@ def test_action_extras_are_cyan_and_a_duplicate_of_the_body_is_dropped():
 def test_turning_action_extras_off_removes_the_cyan_frames():
     frames = [frame(2), frame(12), frame(22)]
     base = analysis([shot(0, 24, frames, motion=30)])
-    full = propose(base, settings(action_extras=2, min_marker_frames=4))
-    quiet = propose(base, settings(action_extras=0, min_marker_frames=4))
+    full = propose(base, settings(action_extras=2, min_marker_seconds=4 / 24))
+    quiet = propose(base, settings(action_extras=0, min_marker_seconds=4 / 24))
     assert sum(item["color"] == EXTRA for item in full["proposals"]) == 2
     assert [item["color"] for item in quiet["proposals"]] == [CORE]
 
@@ -149,9 +149,9 @@ def test_compression_keeps_the_page_count_inside_the_chosen_range():
     shots = [shot(0, 80, [frame(40)], opening=True)]
     for index, start in enumerate((80, 160, 240, 320), start=1):
         shots.append(shot(start, start + 80, [frame(start + 40)], cut_grey=80))
-    loose = propose(analysis(shots), settings(compression=0, target_pages_min=5, target_pages_max=5, min_green_frames=1,
+    loose = propose(analysis(shots), settings(compression=0, target_pages_min=5, target_pages_max=5, min_green_seconds=1 / 24, episode_minutes=0,
                                               core_page_min=1, total_page_min=1))
-    tight = propose(analysis(shots), settings(compression=1, target_pages_min=2, target_pages_max=2, min_green_frames=1,
+    tight = propose(analysis(shots), settings(compression=1, target_pages_min=2, target_pages_max=2, min_green_seconds=1 / 24, episode_minutes=0,
                                               core_page_min=1, total_page_min=1))
     assert sum(item["color"] == PAGE for item in loose["proposals"]) == 5
     assert sum(item["color"] == PAGE for item in tight["proposals"]) == 2
@@ -162,7 +162,7 @@ def test_compression_keeps_the_page_count_inside_the_chosen_range():
 def test_two_scene_opens_respect_the_minimum_gap():
     first = shot(0, 40, [frame(30)], opening=True)
     second = shot(40, 80, [frame(70)], cut_grey=80)
-    result = propose(analysis([first, second]), settings(min_green_frames=100))
+    result = propose(analysis([first, second]), settings(min_green_seconds=100 / 24))
     colours = [item["color"] for item in result["proposals"]]
     assert colours == [PAGE, CORE]
 
@@ -183,4 +183,31 @@ def test_a_page_drops_cyan_before_corps_and_stops_at_the_floor():
     kept, warnings = _trim_pages(page, settings(
         core_page_min=3, core_page_max=2, total_page_min=1, total_page_max=8))
     assert [item["frame"] for item in kept] == [10, 30, 35, 40, 50]
-    assert warnings and "ceiling" in warnings[0]
+    assert warnings and "maximum" in warnings[0]
+
+
+def test_a_short_range_gets_its_share_of_the_episode_pages():
+    from vispa_mp.rules import analyzed_minutes, page_goal
+    data = settings(compression=0, target_pages_min=45, target_pages_max=60, episode_minutes=24)
+    assert page_goal(data) == 60
+    assert page_goal(data, minutes=4) == 10
+    assert page_goal(settings(episode_minutes=0, compression=0, target_pages_max=60), minutes=4) == 60
+    assert abs(analyzed_minutes({"fps": 50, "range": [188822, 199480]}) - 3.55) < 0.01
+    assert analyzed_minutes({"fps": 24, "shots": [{"start": 0, "end": 1440}]}) == 1.0
+    assert analyzed_minutes({"fps": 0, "shots": []}) is None
+
+
+def test_gaps_in_seconds_keep_their_length_at_any_frame_rate():
+    from vispa_mp.rules import gap_frames
+    data = settings(min_marker_seconds=0.33, min_green_seconds=2.0)
+    assert gap_frames(dict(data, _fps=24), "min_marker_seconds") == 8
+    assert gap_frames(dict(data, _fps=50), "min_marker_seconds") == 16
+    assert gap_frames(dict(data, _fps=50), "min_green_seconds") == 100
+    assert gap_frames(data, "min_green_seconds") == 48  # no frame rate known: 24 fps
+    # Two lines 10 frames apart: 0.4 s at 25 fps, 0.2 s at 50 fps.
+    frames = [frame(10, open_mouth=0.9, closed_mouth=0.05), frame(20, open_mouth=0.9, closed_mouth=0.05)]
+    lines = [{"start": 0, "end": 15}, {"start": 15, "end": 40}]
+    slow = propose(analysis([shot(0, 100, frames)], fps=25, utterances=lines), settings(min_marker_seconds=0.3))
+    fast = propose(analysis([shot(0, 100, frames)], fps=50, utterances=lines), settings(min_marker_seconds=0.3))
+    assert {10, 20} <= {item["frame"] for item in slow["proposals"]}
+    assert not {10, 20} <= {item["frame"] for item in fast["proposals"]}

@@ -244,6 +244,7 @@ def analyze(snapshot, settings, sources=None, progress=None, cancel=None, store=
         "fps": fps,
         "timebase": {
             "fps": fps,
+            "timecode_fps": float(snapshot.get("timecode_fps") or fps),
             "start_frame": int(snapshot.get("start_frame") or 0),
             "start_timecode": snapshot.get("start_timecode") or "00:00:00:00",
             "drop": bool(snapshot.get("drop")),

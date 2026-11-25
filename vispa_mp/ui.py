@@ -5,6 +5,7 @@ inside this window: dragging the Video 1 ruler does not move Resolve.
 """
 
 import os
+import re
 import threading
 from functools import partial
 from pathlib import Path
@@ -15,15 +16,18 @@ from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
     QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QSizePolicy, QSlider, QSpinBox, QStackedWidget, QTabWidget, QToolButton, QVBoxLayout,
-    QWidget, QMainWindow, QMessageBox,
+    QWidget, QMainWindow, QMessageBox, QFileDialog,
 )
+
+from shiboken6 import isValid
 
 from vispa_mp.analyze import analyze, refresh_utterances, saved_analysis
 from vispa_mp.client import open_client
 from vispa_mp.resolve_link import free_script_installed, link_running
-from vispa_mp.markers import NAMES, PAGE
-from vispa_mp.preset import load, load_user, save_user
-from vispa_mp.rules import _cavity, page_goal, propose, target_pages
+from vispa_mp.markers import EXTRA, NAMES, PAGE
+from vispa_mp.preset import SAVED_DIR, export_settings, import_settings, load, load_user, save_user
+from vispa_mp.rules import _cavity, analyzed_minutes, page_goal, propose, target_pages
+from vispa_mp.snapshot import describe_rate, normalize
 from vispa_mp.timebase import format_timecode
 from vispa_mp.ui_tokens import (
     ACCENT, APP_BG, BAR_BG, BORDER_ROW, BORDER_STRONG, CONTROL, CONTROL_BG, HEADER_HEIGHT, MONO_FAMILY, PANEL_BG,
@@ -34,64 +38,98 @@ from vispa_mp.window_chrome import BORDER_COLOUR, ChromeDialog, TitleBar, Window
 
 ICONS = Path(__file__).resolve().parent / "icons"
 LINE = "#1F4250"  # the one-pixel line between two surfaces
+THUMB_W, THUMB_H = 192, 108  # the largest 16:9 still on a page card
+THUMB_MIN_W = 112  # below this the page scrolls instead of shrinking further
+CARD_TEXT = 60  # timecode, caption and margins under the still
 SWATCH = {"Green": "#3c8c4a", "Blue": "#2f6fed", "Cyan": "#3ec2d6"}
 MANUAL_DOT = "#8AA0A8"
 COLOR_LABEL = {"Green": "Green", "Blue": "Blue", "Cyan": "Cyan"}
 FORMATS = (("A5", 148, 210), ("A4", 210, 297), ("B5", 176, 250), ("Custom", None, None))
 SLIDER_SCALE = {"compression": 100, "mouth_min": 100, "sharpness_floor": 2}
 INTEGERS = {
-    "min_marker_frames", "speech_min_silence_ms", "speech_min_duration_ms", "speech_pad_ms",
-    "action_extras", "min_green_frames", "candidates_per_line",
+    "speech_min_silence_ms", "speech_min_duration_ms", "speech_pad_ms",
+    "action_extras", "candidates_per_line",
     "target_pages_min", "target_pages_max", "core_page_min", "core_page_max",
-    "total_page_min", "total_page_max",
+    "total_page_min", "total_page_max", "episode_minutes",
 }
 SPINS = (
-    ("end_fraction", "End of shot", 0.05, 0.9, 0.05),
-    ("sharpness_ratio", "Sharpness relative to the shot", 0, 1, 0.05),
-    ("motion_blur_max", "Motion blur maximum", 0, 1, 0.05),
-    ("hold_ratio", "Hold, gap to neighbors", 0.5, 3, 0.05),
-    ("min_marker_frames", "Minimum gap between markers", 1, 96, 1),
-    ("expression_weight", "Expression weight", 0, 1, 0.05),
-    ("speech_min_silence_ms", "Silence between lines (ms)", 40, 2000, 10),
-    ("speech_min_duration_ms", "Minimum line (ms)", 40, 2000, 10),
-    ("speech_threshold", "Speech threshold", 0.05, 0.95, 0.05),
-    ("speech_pad_ms", "Padding around a line (ms)", 0, 400, 10),
-    ("action_max_seconds", "Action shot, maximum length (s)", 0.2, 10, 0.1),
-    ("action_motion", "Action shot, minimum motion", 0, 80, 0.5),
-    ("action_extras", "Action extras", 0, 8, 1),
-    ("duplicate_diff", "Images too alike", 0, 40, 0.5),
-    ("scene_grey", "Scene change (gray)", 0, 120, 1),
-    ("scene_colour", "Scene change (color)", 0, 1, 0.05),
-    ("group_min", "Group shot", 0, 1, 0.05),
-    ("min_green_frames", "Minimum gap between pages", 0, 500, 1),
-    ("target_pages_min", "Target pages, minimum", 1, 400, 1),
-    ("target_pages_max", "Target pages, maximum", 1, 400, 1),
-    ("core_page_min", "Body images per page, floor", 0, 30, 1),
-    ("core_page_max", "Body images per page, ceiling", 1, 30, 1),
-    ("total_page_min", "Images per page, floor", 0, 40, 1),
-    ("total_page_max", "Images per page, ceiling", 1, 40, 1),
+    ("end_fraction", "End of shot, share of the shot", 0.05, 0.9, 0.05),
+    ("sharpness_ratio", "Sharpness against the shot, minimum", 0, 1, 0.05),
+    ("motion_blur_max", "Motion blur, maximum", 0, 1, 0.05),
+    ("hold_ratio", "Held drawing, tolerance", 0.5, 3, 0.05),
+    ("min_marker_seconds", "Time between markers, minimum (s)", 0, 4, 0.05),
+    ("expression_weight", "Facial expression, weight", 0, 1, 0.05),
+    ("speech_min_silence_ms", "Silence separation (ms)", 40, 2000, 10),
+    ("speech_min_duration_ms", "Line length, minimum (ms)", 40, 2000, 10),
+    ("speech_threshold", "Speech probability, minimum", 0.05, 0.95, 0.05),
+    ("speech_pad_ms", "Margin around a line (ms)", 0, 400, 10),
+    ("action_max_seconds", "Action shot length, maximum (s)", 0.2, 10, 0.1),
+    ("action_motion", "Action shot motion, minimum", 0, 80, 0.5),
+    ("action_extras", "Extras per action shot", 0, 8, 1),
+    ("duplicate_diff", "Look-alike images, difference", 0, 40, 0.5),
+    ("scene_grey", "Scene change, brightness", 0, 120, 1),
+    ("scene_colour", "Scene change, colors", 0, 1, 0.05),
+    ("group_min", "Group shot, confidence", 0, 1, 0.05),
+    ("min_green_seconds", "Time between pages, minimum (s)", 0, 30, 0.25),
+    ("target_pages_min", "Pages, minimum", 1, 400, 1),
+    ("target_pages_max", "Pages, maximum", 1, 400, 1),
+    ("core_page_min", "Core images, minimum", 0, 30, 1),
+    ("core_page_max", "Core images, maximum", 1, 30, 1),
+    ("total_page_min", "All images, minimum", 0, 40, 1),
+    ("total_page_max", "All images, maximum", 1, 40, 1),
     ("candidates_per_line", "Images examined per line", 1, 8, 1),
+    ("episode_minutes", "Episode length (min)", 0, 180, 1),
 )
 
 SPIN_OF = {key: (label, low, high, step) for key, label, low, high, step in SPINS}
+CORE_TIP = "Green and blue markers of one page: the page start and its Core images."
+ALL_TIP = "Every marker of one page: Core images and the cyan Extras."
+TIPS = {
+    "target_pages_min": "Pages for a whole episode. A shorter In/Out range gets its share.",
+    "target_pages_max": "Pages for a whole episode. A shorter In/Out range gets its share.",
+    "episode_minutes": "The length the page counts are for. 0 applies them to whatever is analyzed.",
+    "core_page_min": CORE_TIP,
+    "core_page_max": CORE_TIP,
+    "total_page_min": ALL_TIP,
+    "total_page_max": ALL_TIP,
+    "min_green_seconds": "Two page starts are never closer than this.",
+    "scene_grey": "How much the brightness must jump at a cut for a new page to open.",
+    "scene_colour": "How much the colors must change at a cut for a new page to open.",
+    "group_min": "How sure the recognition must be that several characters are in view to open a page.",
+    "end_fraction": "The last part of a shot where its Core image is looked for. 0.30 is the last 30 %.",
+    "sharpness_ratio": "An image must reach this share of the sharpest image of its shot.",
+    "motion_blur_max": "Images the recognition finds more blurred than this are left out.",
+    "hold_ratio": "How close an image must stay to its neighbours to count as a held drawing.",
+    "expression_weight": "How much a visible expression (smile, anger, surprise) favours an image.",
+    "min_marker_seconds": "Two markers of the same shot are never closer than this.",
+    "duplicate_diff": "Below this difference an Extra is too close to a Core image and is dropped.",
+    "action_max_seconds": "Shots up to this length with a lot of motion get Extras.",
+    "action_motion": "How much a shot must move to count as action.",
+    "speech_threshold": "How sure the speech detection must be. Lower finds quieter lines.",
+    "speech_min_silence_ms": "A silence this long splits two lines.",
+    "speech_min_duration_ms": "Shorter sounds are not lines.",
+    "speech_pad_ms": "Time added before and after each line.",
+    "candidates_per_line": "Images of each line sent to the recognition. More is slower.",
+}
 CHECKS = {
-    "require_open_mouth": "Require an open mouth",
-    "keep_second_mouth": "Keep a second mouth",
+    "require_open_mouth": "A line needs an open mouth",
+    "keep_second_mouth": "Add a second open mouth as an Extra",
     "skip_marked_shots": "Skip shots that already have markers",
-    "use_in_out": "Analyze the In/Out range",
+    "use_in_out": "Analyze only the In/Out range",
 }
 # Settings window: tab, then sections of (title, keys). "compression" and
 # "mouth_fallback" are built apart; every other key is a spin box or a check box.
 SETTINGS_TABS = (
     ("Pages", (
-        ("Story length", ("compression", "target_pages_min", "target_pages_max")),
-        ("Images per page", ("core_page_min", "core_page_max", "total_page_min", "total_page_max")),
-        ("New page", ("min_green_frames", "scene_grey", "scene_colour", "group_min")),
+        ("Pages per episode", ("compression", "target_pages_min", "target_pages_max", "episode_minutes")),
+        ("Images per page",
+         ("core_page_min", "core_page_max", "total_page_min", "total_page_max")),
+        ("New page", ("min_green_seconds", "scene_grey", "scene_colour", "group_min")),
     )),
     ("Images", (
         ("Choosing an image", ("end_fraction", "sharpness_ratio", "motion_blur_max", "hold_ratio",
                                "expression_weight")),
-        ("Spacing", ("min_marker_frames", "duplicate_diff")),
+        ("Spacing", ("min_marker_seconds", "duplicate_diff")),
         ("Action shots", ("action_max_seconds", "action_motion", "action_extras")),
     )),
     ("Speech", (
@@ -135,6 +173,42 @@ def dark_palette():
     palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(TEXT_MUTED))
     palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor(TEXT_MUTED))
     return palette
+
+
+# Rule warnings that come once per page or per line, told once with their count.
+FOLDED = (
+    (re.compile(r"^Page at frame \d+: .* below the minimum\.$"),
+     "{n} pages have fewer images than the minimum (Settings › Pages › Images per page)."),
+    (re.compile(r"^Page at frame \d+: the minimum keeps the page above the maximum\.$"),
+     "{n} pages stay above the maximum because of the minimum."),
+    (re.compile(r"^Line at frame \d+ has no examined image\.$"),
+     "{n} lines have no examined image."),
+)
+
+
+def fold_warnings(lines):
+    """Several warnings of one kind become one line; the full list stays in the tooltip."""
+    shown, counts = [], {}
+    for line in lines:
+        for pattern, summary in FOLDED:
+            if pattern.match(line):
+                if summary not in counts:
+                    shown.append(summary)
+                counts[summary] = counts.get(summary, 0) + 1
+                break
+        else:
+            shown.append(line)
+    folded = []
+    for line in shown:
+        if line in counts:
+            if counts[line] == 1:
+                folded.append(next(item for item in lines
+                                   for pattern, summary in FOLDED if summary == line and pattern.match(item)))
+            else:
+                folded.append(line.format(n=counts[line]))
+        else:
+            folded.append(line)
+    return folded
 
 
 def group_pages(proposals, manual_frames):
@@ -624,7 +698,8 @@ def _theme():
     QTabWidget#settingsTabs QTabBar {{ background: {BAR_BG}; }}
     QTabBar::tab {{ background: transparent; color: {TEXT_MUTED}; border: 0; border-bottom: 2px solid transparent;
         padding: 8px 16px; margin: 0; }}
-    QTabBar::tab:hover {{ color: {TEXT_MAIN}; }}
+    QTabBar::tab:hover:!selected {{ color: {TEXT_MAIN}; background: {CONTROL_BG};
+        border-bottom: 2px solid {BORDER_STRONG}; }}
     QTabBar::tab:selected {{ color: {ACCENT}; border-bottom: 2px solid {ACCENT}; font-weight: 600; }}
 
     QAbstractSpinBox {{ background: {APP_BG}; color: {TEXT_MAIN}; border: 1px solid {BORDER_ROW};
@@ -845,20 +920,32 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         column = QVBoxLayout(page)
         column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(8)
-        self.thumb_area, self.thumb_layout = self._horizontal_strip(148)
-        column.addWidget(self.thumb_area)
+        # Every image of the selected page at once, in rows that follow the width.
+        self.thumb_area = QScrollArea()
+        self.thumb_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.thumb_area.setWidgetResizable(True)
+        self.thumb_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        host = QWidget()
+        self.thumb_layout = QGridLayout(host)
+        self.thumb_layout.setContentsMargins(0, 0, 0, 0)
+        self.thumb_layout.setSpacing(8)
+        self.thumb_layout.setSizeConstraint(QGridLayout.SizeConstraint.SetMinimumSize)
+        self.thumb_area.setWidget(host)
+        self.thumb_area.viewport().installEventFilter(self)
+        self._thumb_items = None
+        self._thumb_fit = None
+        column.addWidget(self.thumb_area, 1)
         suggestions = QLabel("Suggestions")
         suggestions.setProperty("role", "panelTitle")
         column.addWidget(suggestions)
         self.suggestion_area, self.suggestion_layout = self._horizontal_strip(128)
         column.addWidget(self.suggestion_area)
-        column.addStretch(1)
         return page
 
     def _horizontal_strip(self, height):
         area = QScrollArea()
         area.setFrameShape(QFrame.Shape.NoFrame)
-        area.setWidgetResizable(False)
+        area.setWidgetResizable(True)
         area.setFixedHeight(height)
         area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -866,6 +953,8 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         row = QHBoxLayout(host)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
+        # The host never gets narrower than its cards: the strip scrolls instead of piling them up.
+        row.setSizeConstraint(QHBoxLayout.SizeConstraint.SetMinimumSize)
         area.setWidget(host)
         return area, row
 
@@ -957,7 +1046,7 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         sharpness = self._labeled_slider("sharpness_floor", "Sharpness", 0, 1000, values, self.sharpness_value)
         form_layout.addWidget(sharpness)
         self.mouth_value = QLabel()
-        mouth = self._labeled_slider("mouth_min", "Mouth", 0, 100, values, self.mouth_value)
+        mouth = self._labeled_slider("mouth_min", "Open mouth", 0, 100, values, self.mouth_value)
         form_layout.addWidget(mouth)
         self.recalculate_button = QPushButton("Recalculate")
         self.recalculate_button.setObjectName("recalculate")
@@ -1028,9 +1117,9 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         row.addWidget(self.status, 1)
         row.addStretch(1)
-        tracks = QLabel("Video 1 · Audio 1")
-        tracks.setProperty("role", "muted")
-        row.addWidget(tracks)
+        self.tracks_label = QLabel("Video 1 · Audio 1")
+        self.tracks_label.setProperty("role", "muted")
+        row.addWidget(self.tracks_label)
         return footer
 
     def _build_settings(self):
@@ -1043,6 +1132,7 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         self.settings_tabs = QTabWidget()
         self.settings_tabs.setObjectName("settingsTabs")
         self.settings_tabs.setDocumentMode(True)
+        self.settings_tabs.tabBar().setDrawBase(False)
         for title, sections in SETTINGS_TABS:
             self.settings_tabs.addTab(self._settings_page(sections, values), title)
         outer.addWidget(self.settings_tabs, 1)
@@ -1052,12 +1142,20 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         buttons = QHBoxLayout()
         buttons.setContentsMargins(16, 0, 16, 0)
         buttons.setSpacing(8)
+        self.save_preset_button = QPushButton("Save…")
+        self.save_preset_button.setToolTip("Save these settings to a file, to load them in another project.")
+        self.load_preset_button = QPushButton("Load…")
+        self.load_preset_button.setToolTip("Load settings saved earlier. The page format stays.")
+        self.save_preset_button.clicked.connect(self._save_preset)
+        self.load_preset_button.clicked.connect(self._load_preset)
         self.reset_button = QPushButton("Reset")
         self.reset_button.setToolTip("Back to the shipped settings. The page format stays.")
         self.download_button = QPushButton("Download models")
         self.reset_button.clicked.connect(self.reset_settings)
         self.download_button.clicked.connect(self.download_models)
         buttons.addWidget(self.reset_button)
+        buttons.addWidget(self.save_preset_button)
+        buttons.addWidget(self.load_preset_button)
         buttons.addStretch(1)
         buttons.addWidget(self.download_button)
         outer.addLayout(buttons)
@@ -1121,13 +1219,13 @@ class MainWindow(WindowChromeMixin, QMainWindow):
             return
         if key == "mouth_fallback":
             mouth = QComboBox()
-            mouth.addItem("Sharp image", "sharp")
-            mouth.addItem("Propose nothing", "none")
+            mouth.addItem("Take the sharpest image", "sharp")
+            mouth.addItem("Propose no image", "none")
             mouth.setCurrentIndex(max(0, mouth.findData(values["mouth_fallback"])))
             mouth.currentIndexChanged.connect(self._changed)
-            mouth.setFixedWidth(150)
+            mouth.setFixedWidth(190)
             self.widgets["mouth_fallback"] = mouth
-            form.addRow("If the mouth is not seen", mouth)
+            form.addRow("When no mouth is visible", mouth)
             return
         if key in CHECKS:
             box = QCheckBox(CHECKS[key])
@@ -1151,7 +1249,11 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         widget.setFixedWidth(110)
         widget.valueChanged.connect(self._changed)
         self.widgets[key] = widget
-        form.addRow(label, widget)
+        caption = QLabel(label)
+        if key in TIPS:
+            caption.setToolTip(TIPS[key])
+            widget.setToolTip(TIPS[key])
+        form.addRow(caption, widget)
 
     def _muted(self, text):
         label = QLabel(text)
@@ -1212,6 +1314,44 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         else:
             widget.setValue(value)
 
+    def save_settings_file(self, path):
+        export_settings(self.settings(), path)
+        self.status.setText(f"Settings saved: {Path(path).name}")
+
+    def load_settings_file(self, path):
+        """Apply a saved settings file, as if each value had been set by hand."""
+        values = import_settings(path)
+        self._ready = False
+        self._stored_settings = {**self._stored_settings, **values}
+        for key, value in values.items():
+            if key in self.widgets:
+                self.set_setting(key, value)
+        self._ready = True
+        self.save_settings()
+        self._refresh_target()
+        self.recompute()
+        self.status.setText(f"Settings loaded: {Path(path).name}")
+
+    def _save_preset(self):
+        SAVED_DIR.mkdir(parents=True, exist_ok=True)
+        path, _kind = QFileDialog.getSaveFileName(
+            self.settings_dialog, "Save settings", str(SAVED_DIR / "settings.json"), "VISPA MP settings (*.json)")
+        if path:
+            try:
+                self.save_settings_file(path)
+            except OSError as error:
+                QMessageBox.warning(self.settings_dialog, "VISPA MP", f"The settings were not saved: {error}")
+
+    def _load_preset(self):
+        SAVED_DIR.mkdir(parents=True, exist_ok=True)
+        path, _kind = QFileDialog.getOpenFileName(
+            self.settings_dialog, "Load settings", str(SAVED_DIR), "VISPA MP settings (*.json)")
+        if path:
+            try:
+                self.load_settings_file(path)
+            except ValueError as error:
+                QMessageBox.warning(self.settings_dialog, "VISPA MP", str(error))
+
     def reset_settings(self):
         """Back to presets/default.json. The page format is a view choice and stays."""
         self._ready = False
@@ -1254,11 +1394,17 @@ class MainWindow(WindowChromeMixin, QMainWindow):
 
     def _timebase(self):
         if self.analysis and self.analysis.get("timebase"):
-            return self.analysis["timebase"]
+            base = dict(self.analysis["timebase"])
+            # An analysis saved before interlacing was read takes the rate from the timeline just read.
+            if not base.get("timecode_fps") and self.snapshot and self.snapshot.get("timecode_fps"):
+                if float(self.snapshot.get("fps") or 0) == float(base.get("fps") or 0):
+                    base["timecode_fps"] = self.snapshot["timecode_fps"]
+            return base
         if not self.snapshot:
             return None
         return {
             "fps": self.snapshot.get("fps") or 24,
+            "timecode_fps": self.snapshot.get("timecode_fps"),
             "start_frame": self.snapshot.get("start_frame") or 0,
             "start_timecode": self.snapshot.get("start_timecode") or "00:00:00:00",
             "drop": bool(self.snapshot.get("drop")),
@@ -1496,39 +1642,71 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         self.ruler.set_view(start, end, blocks, self.playhead_frame, self._timebase())
 
     def _refresh_thumbs(self):
-        self._clear_layout(self.thumb_layout)
         page = self._page(self.selected_page_id) if self.selected_page_id is not None else None
-        if page is None:
-            self.thumb_layout.addWidget(self._muted("No page yet."))
-        else:
-            for item in page["items"]:
-                self.thumb_layout.addWidget(self._thumb(item))
-        self.thumb_layout.addStretch(1)
-        self.thumb_area.widget().adjustSize()
+        self._thumb_items = None if page is None else list(page["items"])
+        self._thumb_fit = None
+        self._place_thumbs()
 
-    def _thumb(self, item):
+    def _thumb_size(self, count):
+        """The largest card width that shows ``count`` cards in the visible area, and its columns."""
+        gap = self.thumb_layout.spacing()
+        width = max(1, self.thumb_area.viewport().width())
+        height = max(1, self.thumb_area.viewport().height())
+        for still in range(THUMB_W, THUMB_MIN_W - 1, -8):
+            columns = max(1, (width + gap) // (still + 12 + gap))
+            rows = (count + columns - 1) // columns
+            if rows * (still * 9 // 16 + CARD_TEXT) + (rows - 1) * gap <= height:
+                return still, columns
+        return THUMB_MIN_W, max(1, (width + gap) // (THUMB_MIN_W + 12 + gap))
+
+    def _place_thumbs(self):
+        """Every image of the page in view: rows follow the width, cards shrink to fit the height."""
+        items = self._thumb_items
+        fit = ("empty",) if not items else self._thumb_size(len(items))
+        if fit == self._thumb_fit:
+            return
+        self._thumb_fit = fit
+        self._clear_layout(self.thumb_layout)
+        for index in range(self.thumb_layout.columnCount() + 1):
+            self.thumb_layout.setColumnStretch(index, 0)
+        for index in range(self.thumb_layout.rowCount() + 1):
+            self.thumb_layout.setRowStretch(index, 0)
+        if not items:
+            self.thumb_layout.addWidget(self._muted("No page yet."), 0, 0)
+            self.thumb_layout.setColumnStretch(1, 1)
+            self.thumb_layout.setRowStretch(1, 1)
+            return
+        still, columns = fit
+        for index, item in enumerate(items):
+            self.thumb_layout.addWidget(self._thumb(item, still), index // columns, index % columns,
+                                        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.thumb_layout.setColumnStretch(columns, 1)
+        self.thumb_layout.setRowStretch((len(items) + columns - 1) // columns, 1)
+
+    def eventFilter(self, watched, event):
+        area = getattr(self, "thumb_area", None)
+        if (event.type() == QEvent.Type.Resize and area is not None and isValid(area)
+                and watched is area.viewport()):
+            self._place_thumbs()
+        return super().eventFilter(watched, event)
+
+    def _thumb(self, item, still=THUMB_W):
         frame = item_frame(item)
+        high = still * 9 // 16
         card = QFrame()
         card.setProperty("role", "card")
-        card.setFixedSize(132, 128)
+        card.setFixedSize(still + 12, high + CARD_TEXT)
         chosen = frame == self.selected_frame and item["manual"] == self.selected_manual
         card.setProperty("selected", "true" if chosen else "false")
         column = QVBoxLayout(card)
         column.setContentsMargins(6, 6, 6, 6)
         column.setSpacing(2)
         picture = QLabel()
-        picture.setFixedHeight(68)
+        picture.setFixedSize(still, high)
         picture.setAlignment(Qt.AlignmentFlag.AlignCenter)
         path = "" if item["manual"] else (item["proposal"].get("image") or "")
-        pixmap = QPixmap(path) if path and Path(path).is_file() else QPixmap()
-        if pixmap.isNull():
-            color = MANUAL_DOT if item["manual"] else SWATCH.get(item["proposal"]["color"], MANUAL_DOT)
-            blank = QPixmap(120, 68)
-            blank.fill(QColor(color))
-            picture.setPixmap(blank)
-        else:
-            picture.setPixmap(pixmap.scaled(120, 68, Qt.AspectRatioMode.KeepAspectRatio,
-                                            Qt.TransformationMode.SmoothTransformation))
+        color = MANUAL_DOT if item["manual"] else SWATCH.get(item["proposal"]["color"], MANUAL_DOT)
+        picture.setPixmap(self._scaled(path, still, high, color))
         column.addWidget(picture)
         timecode = QLabel(self.timecode_of(frame))
         timecode.setProperty("role", "mono")
@@ -1543,6 +1721,21 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         card.mousePressEvent = lambda _event, frame=frame, manual=item["manual"]: self._choose_frame(frame, manual)
         return card
 
+    def _scaled(self, path, width, height, fallback):
+        """A still at card size, kept in memory: going back to a page does not read the disk again."""
+        cache = self.__dict__.setdefault("_thumb_cache", {})
+        key = (path, width, height)
+        if key not in cache:
+            pixmap = QPixmap(path) if path and Path(path).is_file() else QPixmap()
+            if pixmap.isNull():
+                pixmap = QPixmap(width, height)
+                pixmap.fill(QColor(fallback))
+            else:
+                pixmap = pixmap.scaled(width, height, Qt.AspectRatioMode.KeepAspectRatio,
+                                       Qt.TransformationMode.SmoothTransformation)
+            cache[key] = pixmap
+        return cache[key]
+
     def _refresh_suggestions(self):
         self._clear_layout(self.suggestion_layout)
         frames = self._suggestion_frames()
@@ -1552,7 +1745,6 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         for frame in frames:
             self.suggestion_layout.addWidget(self._suggestion(frame, settings))
         self.suggestion_layout.addStretch(1)
-        self.suggestion_area.widget().adjustSize()
 
     def _suggestion_frames(self):
         if self.selected_manual or self.selected_frame is None or not self.analysis:
@@ -1588,15 +1780,7 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         picture = QLabel()
         picture.setFixedHeight(68)
         picture.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        path = frame.get("image") or ""
-        pixmap = QPixmap(path) if path and Path(path).is_file() else QPixmap()
-        if pixmap.isNull():
-            blank = QPixmap(92, 68)
-            blank.fill(QColor(PANEL_TITLE_BG))
-            picture.setPixmap(blank)
-        else:
-            picture.setPixmap(pixmap.scaled(92, 68, Qt.AspectRatioMode.KeepAspectRatio,
-                                            Qt.TransformationMode.SmoothTransformation))
+        picture.setPixmap(self._scaled(frame.get("image") or "", 92, 68, PANEL_TITLE_BG))
         column.addWidget(picture)
         label = QLabel(motif_of(frame, settings))
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1737,15 +1921,21 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         if not hasattr(self, "page_target"):
             return
         data = self.settings()
-        goal = page_goal(data)
         shots = len((self.analysis or {}).get("shots") or [])
+        episode = int(data.get("episode_minutes") or 0)
+        whole = f"{self._count(page_goal(data), 'page')} for {episode} min" if episode else ""
         if not shots:
             high = max(int(data["target_pages_min"]), int(data["target_pages_max"]))
             low = min(int(data["target_pages_min"]), int(data["target_pages_max"]))
-            self.page_target.setText(f"Low: {self._count(high, 'page')} · High: {self._count(low, 'page')}")
+            self.page_target.setText(f"Low: {self._count(high, 'page')} · High: {self._count(low, 'page')}"
+                                     + (f" · for {episode} min" if episode else ""))
             return
-        aimed = target_pages(data, shots)
+        minutes = analyzed_minutes(self.analysis)
+        goal = page_goal(data, minutes)
+        aimed = target_pages(data, shots, minutes)
         text = f"Target: {self._count(aimed, 'page')}"
+        if minutes and episode:
+            text += f" for these {minutes:.1f} min ({whole})"
         if aimed < goal:
             text += f" — {self._count(goal, 'page')} asked, {self._count(shots, 'shot')}"
         self.page_target.setText(text)
@@ -1764,8 +1954,10 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         return unique
 
     def _show_warnings(self):
-        text = "\n".join(self._warning_lines())
+        lines = self._warning_lines()
+        text = "\n".join(fold_warnings(lines))
         self.warnings.setText(text)
+        self.warnings.setToolTip("\n".join(lines) if len(lines) > 1 else "")
         self.warnings.setVisible(bool(text))
 
     def _sync_header(self):
@@ -1855,7 +2047,7 @@ class MainWindow(WindowChromeMixin, QMainWindow):
 
         def work(_progress):
             client = self.client or open_client()
-            snapshot = client.read()
+            snapshot = normalize(client.read())
             saved = None
             try:
                 saved = saved_analysis(snapshot, settings, cache)
@@ -1865,6 +2057,7 @@ class MainWindow(WindowChromeMixin, QMainWindow):
 
         def done(payload):
             self.client, self.snapshot, saved = payload
+            self.tracks_label.setText(f"{describe_rate(self.snapshot)} · Video 1 · Audio 1")
             self._sync_resolve()
             self._sync_header()
             name = self.snapshot.get("timeline_name") or "timeline"

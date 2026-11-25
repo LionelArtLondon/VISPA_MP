@@ -9,7 +9,8 @@ DEFAULTS = {
     "sharpness_ratio": 0.35,
     "motion_blur_max": 0.50,
     "hold_ratio": 1.15,
-    "min_marker_frames": 8,
+    # Gaps are in seconds, so a 50 fps timeline keeps the spacing tuned at 24 fps.
+    "min_marker_seconds": 0.33,
     "expression_weight": 0.15,
     "speech_min_silence_ms": 200,
     "speech_min_duration_ms": 250,
@@ -32,8 +33,12 @@ DEFAULTS = {
     "scene_grey": 30.0,
     "scene_colour": 0.35,
     "group_min": 0.35,
-    "min_green_frames": 48,
+    "min_green_seconds": 2.0,
     "compression": 0.35,
+    # The page targets are for an episode of this length. A shorter In/Out range
+    # gets its share: 4 minutes of a 24-minute episode aim at a sixth of the pages.
+    # 0 applies the targets to whatever is analyzed.
+    "episode_minutes": 24,
     "target_pages_min": 45,
     "target_pages_max": 60,
     "core_page_min": 2,
@@ -99,6 +104,40 @@ def load_user(path=None):
         elif key in VIEW_DEFAULTS and _same_kind(value, VIEW_DEFAULTS[key]):
             view[key] = value
     return settings, view
+
+
+SAVED_DIR = ROOT / "presets" / "saved"
+FILE_KIND = "vispa-mp-settings"
+
+
+def export_settings(settings, path):
+    """A settings file to load later: every marker setting, the page format left out."""
+    import json
+    values = {key: settings[key] for key in DEFAULTS if key in (settings or {})}
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"kind": FILE_KIND, "version": 1, "settings": values},
+                                 indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def import_settings(path):
+    """The usable settings of a saved file. Unknown keys and wrong kinds are left out.
+
+    Raises ValueError when the file is not a VISPA MP settings file.
+    """
+    try:
+        stored = loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ValueError(f"This file cannot be read: {error}") from error
+    if isinstance(stored, dict) and stored.get("kind") == FILE_KIND:
+        stored = stored.get("settings")
+    if not isinstance(stored, dict):
+        raise ValueError("This is not a VISPA MP settings file.")
+    values = {key: value for key, value in stored.items()
+              if key in DEFAULTS and _same_kind(value, DEFAULTS[key])}
+    if not values:
+        raise ValueError("This file holds no VISPA MP setting.")
+    return values
 
 
 def save_user(settings, view, path=None):

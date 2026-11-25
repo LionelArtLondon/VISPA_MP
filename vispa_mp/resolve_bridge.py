@@ -12,6 +12,8 @@ from vispa_mp.markers import AUTOMATIC, cue_warning, is_automatic, plan_apply
 from vispa_mp.timebase import absolute_mark, parse_fps
 
 VIDEO_TRACK = 1
+# Same number as SCRIPT_VERSION in resolve_scripts/VISPA_MP.lua.
+SCRIPT_VERSION = 2
 AUDIO_TRACK = 1
 
 
@@ -157,6 +159,8 @@ def read_timeline(timeline):
     start_frame = int(timeline.GetStartFrame() or 0)
     fps = parse_fps(_setting(timeline, "timelineFrameRate")) or 24.0
     drop_raw = str(_setting(timeline, "timelineDropFrameTimecode") or "").lower()
+    interlace_raw = str(_setting(timeline, "timelineInterlaceProcessing") or "").lower()
+    playback_fps = parse_fps(_setting(timeline, "timelinePlaybackFrameRate"))
     video_names = _track_names(timeline, "video")
     video = []
     for item in timeline.GetItemListInTrack("video", VIDEO_TRACK) or []:
@@ -176,8 +180,10 @@ def read_timeline(timeline):
         warnings.append("Video 1 has no clip linked to a file.")
     if not audio:
         warnings.append("Audio 1 has no clip linked to a file. Lines will not be detected.")
-    return {
+    snapshot = {
         "timeline_name": timeline.GetName() or "",
+        "interlaced": interlace_raw in ("1", "true"),
+        "script_version": SCRIPT_VERSION,
         "start_frame": start_frame,
         "end_frame": int(timeline.GetEndFrame() or 0),
         "fps": fps,
@@ -191,6 +197,9 @@ def read_timeline(timeline):
         "mark_out": mark_out,
         "warnings": warnings,
     }
+    if playback_fps:
+        snapshot["playback_fps"] = playback_fps
+    return snapshot
 
 
 def apply_markers(timeline, proposals, start=None, end=None):
