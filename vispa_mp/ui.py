@@ -1505,6 +1505,13 @@ class MainWindow(WindowChromeMixin, QMainWindow):
             name = self.snapshot.get("timeline_name") or ""
         self.timeline_label.setText(name or "—")
 
+    def _resolve_wait_text(self, busy):
+        """The script only needs launching when it is not already listening."""
+        mailbox = self.client is None or getattr(self.client, "mailbox", False)
+        if mailbox and not link_running():
+            return "In Resolve, run Workspace > Scripts > VISPA_MP once."
+        return busy
+
     def _sync_resolve(self):
         mailbox = self.client is not None and getattr(self.client, "mailbox", False)
         if self.client is not None and not mailbox:
@@ -1555,7 +1562,7 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         QMessageBox.warning(self, "VISPA MP", message)
 
     def read_timeline(self):
-        self.status.setText("In Resolve, run Workspace > Scripts > VISPA_MP.")
+        self.status.setText(self._resolve_wait_text("Reading the timeline…"))
 
         def work(_progress):
             client = self.client or open_client()
@@ -1607,7 +1614,7 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
         payload = self.apply_payload()
-        self.status.setText("In Resolve, run Workspace > Scripts > VISPA_MP.")
+        self.status.setText(self._resolve_wait_text("Placing markers…"))
         found = []
 
         def work(_progress):

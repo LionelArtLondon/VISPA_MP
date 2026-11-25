@@ -1,31 +1,71 @@
 """Serves VISPA MP from inside DaVinci Resolve.
 
-Workspace > Scripts starts this with the globals ``resolve``, ``bmd`` and
-``fusion`` already defined. A small window stays open and answers the mailbox
-without holding the Edit page frozen between commands.
+Workspace > Scripts starts this with the global ``resolve`` already defined.
+It opens no window, because a script window (UIManager) is a Studio feature
+and the free edition stops on it. It keeps answering the mailbox until
+Resolve closes, VISPA MP sends ``stop``, or the script is started again.
 """
+
+import random
+import time
 
 from vispa_mp.resolve_bridge import dispatch
 from vispa_mp.resolve_link import Link
 
-WINDOW_ID = "com.animecomics.vispa_mp"
-TIMER_ID = "VispaTimer"
+POLL_SECONDS = 0.25
+STALE_SECONDS = 300
+
+
+def is_stale(request, now=None):
+    """VISPA MP ids are nanosecond timestamps. Old leftovers must not run."""
+    try:
+        sent = int(request.get("id"))
+    except (TypeError, ValueError):
+        return False
+    if sent < 10 ** 15:
+        return False
+    now = time.time() if now is None else now
+    return now - sent / 1e9 > STALE_SECONDS
 
 
 def handle_once(resolve, link):
-    """Answer the waiting request, if there is one. Safe to call often."""
+    """Answer the waiting request, if there is one. Safe to call often.
+
+    Returns (handled, stopping).
+    """
     request = link.take_request()
-    if not request:
-        return False
+    if not request or is_stale(request):
+        return False, False
+    command = request.get("cmd")
     try:
-        timeline = None
-        if request.get("cmd") != "ping":
-            timeline = _timeline(resolve)
-        result = dispatch(request, timeline)
+        if command == "stop":
+            result = {"ok": True, "stopping": True}
+        else:
+            timeline = None
+            if command != "ping":
+                timeline = _timeline(resolve)
+            result = dispatch(request, timeline)
         link.write_response({"id": request.get("id"), "ok": True, "result": result})
     except Exception as error:
         link.write_response({"id": request.get("id"), "ok": False, "error": str(error)})
-    return True
+        return True, False
+    return True, command == "stop"
+
+
+def replaced_by_newer(status, owner, started):
+    """True when another copy of the script started later and owns the mailbox."""
+    if not isinstance(status, dict) or status.get("running") is not True:
+        return False
+    other = str(status.get("owner") or "")
+    if not other or other == owner:
+        return False
+    try:
+        other_started = int(status.get("started") or 0)
+    except (TypeError, ValueError):
+        other_started = 0
+    if other_started != started:
+        return other_started > started
+    return other > owner
 
 
 def _timeline(resolve):
@@ -48,84 +88,35 @@ def _timeline_name(resolve):
         return ""
 
 
-def serve(resolve, bmd=None, fusion=None):
-    """Stay up until the window closes. Falls back to one pass if there is no window."""
+def serve(resolve, bmd=None, fusion=None, link=None, sleep=time.sleep, max_ticks=None):
+    """Listen until stopped. ``bmd`` and ``fusion`` stay unused on purpose."""
     if resolve is None:
         raise RuntimeError("This script must be started from Workspace > Scripts inside Resolve.")
-    link = Link()
-    ui = getattr(fusion, "UIManager", None) if fusion is not None else None
-    dispatcher_type = getattr(bmd, "UIDispatcher", None) if bmd is not None else None
-    if ui is None or dispatcher_type is None:
-        link.write_status(True, _timeline_name(resolve))
-        handle_once(resolve, link)
-        link.write_status(False, "")
-        return
-    _serve_window(resolve, link, ui, dispatcher_type(ui))
-
-
-def _serve_window(resolve, link, ui, dispatcher):
-    existing = ui.FindWindow(WINDOW_ID) if hasattr(ui, "FindWindow") else None
-    if existing is not None and link.running():
-        existing.Show()
-        raise_ = getattr(existing, "Raise", None)
-        if raise_ is not None:
-            raise_()
-        return
-    if existing is not None:
-        hide = getattr(existing, "Hide", None)
-        if hide is not None:
-            hide()
-
-    window = dispatcher.AddWindow(
-        {
-            "ID": WINDOW_ID,
-            "WindowTitle": "VISPA MP",
-            "Geometry": [80, 80, 440, 150],
-            "Spacing": 8,
-        },
-        ui.VGroup({"Spacing": 8}, [
-            ui.Label({
-                "ID": "Status",
-                "Text": "Waiting for VISPA MP. Leave this window open.",
-                "WordWrap": True,
-            }),
-            ui.Button({"ID": "Stop", "Text": "Stop"}),
-        ]),
-    )
-
-    def say(text):
+    link = link or Link()
+    started = int(time.time())
+    owner = f"{started}-{random.randrange(1_000_000):06d}"
+    link.write_status(True, _timeline_name(resolve), owner, started)
+    print("VISPA MP: listening. Keep working in Resolve; VISPA MP can read the timeline "
+          "and place markers until Resolve closes.")
+    beat = int(time.time())
+    ticks = 0
+    while max_ticks is None or ticks < max_ticks:
+        ticks += 1
+        if replaced_by_newer(link.status(), owner, started):
+            print("VISPA MP: stopped (a newer VISPA_MP took over).")
+            return "replaced"
         try:
-            label = window.Find("Status")
-            if label is not None:
-                label.Text = text
-        except Exception:
-            pass
-
-    def stop(*_args):
-        try:
-            timer.Stop()
-        except Exception:
-            pass
-        link.write_status(False, "")
-        dispatcher.ExitLoop()
-
-    def on_timeout(*_args):
-        try:
-            name = _timeline_name(resolve)
-            if handle_once(resolve, link):
-                say(f"Answered VISPA MP. Timeline: {name or '—'}.")
-            link.write_status(True, name)
+            handled, stopping = handle_once(resolve, link)
         except Exception as error:
-            say(str(error))
-            link.write_status(True, "")
-
-    window.On[WINDOW_ID].Close = stop
-    window.On["Stop"].Clicked = stop
-    timer = ui.Timer({"ID": TIMER_ID, "Interval": 400, "SingleShot": False})
-    dispatcher.On["Timeout"] = on_timeout
-    window.Show()
-    link.write_status(True, _timeline_name(resolve))
-    timer.Start()
-    dispatcher.RunLoop()
-    link.write_status(False, "")
-    window.Hide()
+            print(f"VISPA MP: {error}")
+            handled, stopping = False, False
+        if stopping:
+            link.write_status(False, "", owner, started)
+            print("VISPA MP: stopped (VISPA MP asked it to stop).")
+            return "stopped"
+        now = int(time.time())
+        if handled or now != beat:
+            link.write_status(True, _timeline_name(resolve), owner, started)
+            beat = now
+        sleep(POLL_SECONDS)
+    return "ticks"

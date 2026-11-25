@@ -1,5 +1,6 @@
 # VISPA MP bridge for the free edition of DaVinci Resolve.
-# Start it from Workspace > Scripts > VISPA_MP and leave the window open.
+# Start it once from Workspace > Scripts > VISPA_MP. It opens no window and keeps
+# listening until Resolve closes.
 
 import sys
 from pathlib import Path

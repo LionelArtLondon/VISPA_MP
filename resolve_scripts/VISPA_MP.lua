@@ -1,9 +1,16 @@
 -- VISPA MP bridge for the free edition of DaVinci Resolve.
 -- Workspace > Scripts lists Lua only on this machine, so this file is the menu entry.
--- Leave the window open. VISPA MP talks to it through cache/resolve_link.
+-- Run it once per Resolve session. It opens no window (a script window is a
+-- Studio feature) and keeps answering VISPA MP through cache/resolve_link until
+-- Resolve closes, VISPA MP sends "stop", or the script is run again.
 
 local MAILBOX = [[__MAILBOX__]]
 local AUTOMATIC = "vispa-mp"
+local POLL_SECONDS = 0.25
+local STALE_SECONDS = 300
+local STARTED = os.time()
+math.randomseed(STARTED + math.floor((os.clock() % 1) * 1000000))
+local OWNER = string.format("%d-%06d", STARTED, math.random(0, 999999))
 local ARRAY = {}
 
 local function array(list)
@@ -438,6 +445,7 @@ end
 local function dispatch(command, timeline)
   local name = command.cmd
   if name == "ping" then return { ok = true } end
+  if name == "stop" then return { ok = true, stopping = true } end
   if name == "read" then return read_timeline(timeline) end
   if name == "seek" then
     local ok = call(timeline, "SetCurrentTimecode", command.timecode)
@@ -483,7 +491,35 @@ local function write_status(running, name)
     running = running and true or false,
     at = os.time(),
     timeline = name or "",
+    owner = OWNER,
+    started = STARTED,
   }))
+end
+
+local function read_status()
+  local text = read_file(MAILBOX .. "\\status.json")
+  if not text or text == "" then return nil end
+  local ok, status = pcall(decode, text)
+  if ok and type(status) == "table" then return status end
+  return nil
+end
+
+-- VISPA MP ids are nanosecond timestamps. A request left behind by a VISPA MP
+-- that gave up or crashed must not run when the script starts much later.
+local function is_stale(request, now)
+  local sent = tonumber(request.id)
+  if not sent or sent < 1e15 then return false end
+  return now - sent / 1e9 > STALE_SECONDS
+end
+
+-- True when another copy of this script started later and now owns the mailbox.
+local function replaced_by_newer(status, owner, started)
+  if type(status) ~= "table" or status.running ~= true then return false end
+  local other = tostring(status.owner or "")
+  if other == "" or other == owner then return false end
+  local other_started = tonumber(status.started) or 0
+  if other_started ~= started then return other_started > started end
+  return other > owner
 end
 
 local function handle_once()
@@ -493,16 +529,38 @@ local function handle_once()
   local decoded, request = pcall(decode, text)
   os.remove(path)
   if not decoded or type(request) ~= "table" then return false end
+  if is_stale(request, os.time()) then return false end
   local ran, result = pcall(function()
     local timeline = nil
-    if request.cmd ~= "ping" then timeline = current_timeline() end
+    if request.cmd ~= "ping" and request.cmd ~= "stop" then timeline = current_timeline() end
     return dispatch(request, timeline)
   end)
   local response
   if ran then response = { id = request.id, ok = true, result = result }
   else response = { id = request.id, ok = false, error = tostring(result) } end
   write_atomic(MAILBOX .. "\\response.json", encode(response))
-  return true
+  return true, ran and request.cmd == "stop", tostring(request.cmd or "")
+end
+
+-- Waits without a window. bmd.wait is Fusion's own pause; the Windows Sleep call
+-- through LuaJIT's ffi is the fallback. Spinning on os.clock is the last resort.
+local function pick_sleep()
+  local found, wait = pcall(function() return bmd and bmd.wait end)
+  if found and type(wait) == "function" then
+    return function(seconds) bmd.wait(seconds) end, "bmd.wait"
+  end
+  local loaded, ffi = pcall(require, "ffi")
+  if loaded and type(ffi) == "table" then
+    pcall(ffi.cdef, "void Sleep(unsigned long milliseconds);")
+    local linked = pcall(function() return ffi.C.Sleep end)
+    if linked then
+      return function(seconds) ffi.C.Sleep(math.floor(seconds * 1000)) end, "Sleep"
+    end
+  end
+  return function(seconds)
+    local stop = os.clock() + seconds
+    while os.clock() < stop do end
+  end, "busy"
 end
 
 local function self_check()
@@ -523,26 +581,62 @@ local function self_check()
     { { frame = 1, color = "Blue" }, { frame = 3, color = "Cyan" } },
     0, 10)
   assert(delete[1] == 2 and add[1].frame == 3 and skipped[1] == 1)
+  assert(dispatch({ cmd = "stop" }, nil).stopping == true)
+  assert(replaced_by_newer(nil, "10-1", 10) == false)
+  assert(replaced_by_newer({ running = true, owner = "10-1", started = 10 }, "10-1", 10) == false)
+  assert(replaced_by_newer({ running = true, owner = "11-1", started = 11 }, "10-1", 10) == true)
+  assert(replaced_by_newer({ running = true, owner = "9-1", started = 9 }, "10-1", 10) == false)
+  assert(replaced_by_newer({ running = false, owner = "11-1", started = 11 }, "10-1", 10) == false)
+  assert(replaced_by_newer({ running = true }, "10-1", 10) == false)
+  assert(is_stale({ id = "1700000000000000000" }, 1700000000 + 301) == true)
+  assert(is_stale({ id = "1700000000000000000" }, 1700000000 + 10) == false)
+  assert(is_stale({ id = "abc" }, 1700000000) == false)
+  local sleep, how = pick_sleep()
+  sleep(0.01)
+  print("vispa-mp sleep: " .. how)
   print("vispa-mp self-check ok")
 end
 
-local function serve_once()
-  -- No window. A script window is a Studio feature, and the free edition stops on it.
-  local handled = false
-  local ok, err = pcall(function()
-    write_status(true, timeline_name())
-    handled = handle_once()
-  end)
-  pcall(function() write_status(false, "") end)
+local function serve()
+  -- No window: a script window is a Studio feature and the free edition stops on it.
+  local sleep, how = pick_sleep()
+  local ok, err = pcall(write_status, true, timeline_name())
   if not ok then
     print("VISPA MP: " .. tostring(err))
     return
   end
-  if not handled then
-    print("VISPA MP: no request waiting. Click Read timeline or Place markers in VISPA MP, then run this script again.")
-  else
-    print("VISPA MP: answered.")
+  print("VISPA MP: listening. Keep working in Resolve; VISPA MP can read the timeline and place markers until Resolve closes.")
+  if how == "busy" then
+    print("VISPA MP: no sleep function was found, so this script keeps one CPU core busy.")
   end
+  local beat = os.time()
+  local reason = nil
+  while reason == nil do
+    if replaced_by_newer(read_status(), OWNER, STARTED) then
+      reason = "a newer VISPA_MP took over"
+    else
+      local handled, stopping, command = false, false, ""
+      local ran, problem = pcall(function()
+        handled, stopping, command = handle_once()
+      end)
+      if not ran then print("VISPA MP: " .. tostring(problem)) end
+      if stopping then
+        reason = "VISPA MP asked it to stop"
+        pcall(write_status, false, "")
+      else
+        local now = os.time()
+        if handled or now ~= beat then
+          pcall(write_status, true, timeline_name())
+          beat = now
+        end
+        if handled and command ~= "ping" then
+          print("VISPA MP: answered " .. command .. ".")
+        end
+        sleep(POLL_SECONDS)
+      end
+    end
+  end
+  print("VISPA MP: stopped (" .. reason .. ").")
 end
 
 if not resolve then
@@ -550,4 +644,4 @@ if not resolve then
   return
 end
 
-serve_once()
+serve()

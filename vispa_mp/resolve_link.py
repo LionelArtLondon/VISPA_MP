@@ -13,8 +13,8 @@ from pathlib import Path
 
 SCRIPT_NAME = "VISPA_MP.lua"
 FREE_HINT = (
-    " In Resolve, run Workspace > Scripts > VISPA_MP while this command is waiting. "
-    "The free edition cannot open a script window."
+    " In Resolve, run Workspace > Scripts > VISPA_MP once. "
+    "It opens no window and keeps listening until Resolve closes."
 )
 
 def project_root():
@@ -74,8 +74,15 @@ class Link:
             return False
         return age <= max_age
 
-    def write_status(self, running, timeline=""):
-        self._write("status.json", {"running": bool(running), "at": time.time(), "timeline": timeline or ""})
+    def status(self):
+        return self._read("status.json")
+
+    def write_status(self, running, timeline="", owner=None, started=None):
+        payload = {"running": bool(running), "at": time.time(), "timeline": timeline or ""}
+        if owner is not None:
+            payload["owner"] = owner
+            payload["started"] = started
+        self._write("status.json", payload)
 
     def write_request(self, message):
         self._write("request.json", message)
@@ -156,10 +163,20 @@ class MailboxClient:
                         raise RuntimeError(answer.get("error") or "Resolve refused the command.")
                     return answer.get("result")
                 time.sleep(0.05)
+            self._withdraw(message["id"])
             raise RuntimeError("VISPA_MP did not answer." + FREE_HINT)
+
+    def _withdraw(self, message_id):
+        """A script started later must not run a command the user gave up on."""
+        waiting = self.link._read("request.json")
+        if waiting and waiting.get("id") == message_id:
+            self.link._unlink("request.json")
 
     def ping(self):
         return self.request("ping")
+
+    def stop(self):
+        return self.request("stop")
 
     def read(self):
         return self.request("read")
@@ -172,3 +189,21 @@ class MailboxClient:
 
     def close(self):
         return None
+
+
+def stop_link(link=None, timeout=10):
+    """Ask the listening Resolve script to end. False when none is listening."""
+    link = link or Link()
+    if not link.running():
+        return False
+    MailboxClient(link, timeout=timeout).stop()
+    return True
+
+
+if __name__ == "__main__":
+    import sys
+
+    if sys.argv[1:] == ["stop"]:
+        print("Stopped." if stop_link() else "The VISPA_MP script is not listening.")
+    else:
+        print("Usage: python -m vispa_mp.resolve_link stop")

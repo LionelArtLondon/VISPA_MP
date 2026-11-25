@@ -66,5 +66,7 @@ def test_the_menu_script_is_lua_and_points_at_the_mailbox(tmp_path):
     assert target.name == "VISPA_MP.lua"
     assert "__MAILBOX__" not in text
     assert str(mailbox_dir()) in text
-    assert "no request waiting" in text
+    assert "listening" in text
+    assert "UIManager" not in text
+    assert "UIDispatcher" not in text
     assert not (tmp_path / "VISPA_MP.py").exists()
