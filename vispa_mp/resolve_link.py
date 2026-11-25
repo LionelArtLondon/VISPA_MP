@@ -147,8 +147,11 @@ class Link:
         return parse_request(self._text(REQUEST_FILE))
 
     def take_request(self):
+        """The waiting request, then removed. A read that failed (Windows refuses
+        to open a file while VISPA MP replaces it) leaves the file for the next poll."""
         payload = self.pending_request()
-        self._unlink(REQUEST_FILE)
+        if payload is not None:
+            self._unlink(REQUEST_FILE)
         return payload
 
     def clear_request(self, message_id=None):

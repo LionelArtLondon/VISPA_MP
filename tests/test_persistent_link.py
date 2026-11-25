@@ -222,3 +222,14 @@ def test_the_lua_script_listens_until_told_to_stop(tmp_path, sandbox, menu):
     assert "listening" in output
     assert "VISPA MP asked it to stop" in output
     assert not link.running()
+
+
+def test_an_unreadable_request_is_not_thrown_away(tmp_path, monkeypatch):
+    link = Link(tmp_path)
+    link.write_request({"id": "1", "cmd": "ping"})
+    real_text = Link._text
+    monkeypatch.setattr(Link, "_text", lambda self, name: "" if name == "request.lua" else real_text(self, name))
+    assert link.take_request() is None
+    monkeypatch.setattr(Link, "_text", real_text)
+    assert link.take_request() == {"id": "1", "cmd": "ping"}
+    assert link.pending_request() is None
