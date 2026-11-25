@@ -8,6 +8,7 @@ from pathlib import Path
 from vispa_mp.candidates import candidate_frames
 from vispa_mp.frames import STOPPED, extract_stills, load_filmstrip, load_waveform
 from vispa_mp.preset import setting
+from vispa_mp.progress import Steps
 from vispa_mp.shots import build_shots
 from vispa_mp.speech import Silero, map_turns, turns_from_probs
 from vispa_mp.store import ScoreStore, load_analysis, save_analysis
@@ -68,12 +69,12 @@ def time_left(done, total, elapsed):
 class Live:
     """ffmpeg, Silero and the tagger. Tests pass their own object instead."""
 
-    def __init__(self, cache, progress=None, cancel=None):
+    def __init__(self, cache, steps=None, cancel=None):
         from vispa_mp.models_setup import MODELS, SILERO, WD_LABELS, WD_ONNX, ready
         if not ready():
             raise RuntimeError("The models are missing. Download them before analyzing.")
         self.cache = Path(cache or (MODELS.parent / "cache"))
-        self.progress = progress or (lambda _text: None)
+        self.steps = steps or Steps()
         self.cancel = cancel
         self.silero = Silero(SILERO)
         self.wd_files = (WD_ONNX, WD_LABELS)
@@ -81,20 +82,23 @@ class Live:
         self.scores = ScoreStore(self.cache, model_id(WD_ONNX))
 
     def filmstrip(self, clip):
-        self.progress(f"Pictures from {clip.get('name') or 'video 1'}")
-        return load_filmstrip(clip, self.cache, cancel=self.cancel)
+        return load_filmstrip(clip, self.cache, cancel=self.cancel,
+                              report=self.steps.part(clip.get("name") or "Video 1"))
 
     def waveform(self, clip, fps):
-        self.progress("Sound from " + (clip.get("name") or "audio 1"))
-        return load_waveform(clip, fps, self.cache, cancel=self.cancel)
+        # The sound is half of this step, speech the other half.
+        part = self.steps.part("Reading " + (clip.get("name") or "audio 1"))
+        return load_waveform(clip, fps, self.cache, cancel=self.cancel, report=lambda value: part(value / 2))
 
     def probabilities(self, audio):
-        self.progress("Speech")
-        return self.silero.probabilities(audio, cancel=self.cancel)
+        part = self.steps.part("Finding the lines")
+        return self.silero.probabilities(audio, cancel=self.cancel, report=lambda value: part(0.5 + value / 2))
 
     def score_many(self, frames):
-        self.progress(f"{len(frames)} images to recognize")
-        extract_stills(frames, self.cache, cancel=self.cancel, progress=self.progress)
+        self.steps.start(4, f"0/{len(frames)} images")
+        extract_stills(frames, self.cache, cancel=self.cancel,
+                       report=lambda fraction, detail: self.steps.send(fraction, detail))
+        self.steps.start(5, "")
         todo = []
         for frame in frames:
             known = self.scores.get(frame["image"])
@@ -103,13 +107,14 @@ class Live:
             else:
                 frame.update(known)
         if not todo:
+            self.steps.send(1.0, f"{len(frames)} images, all already known", force=True)
             return
         known = len(frames) - len(todo)
-        aside = f" ({known} already known)" if known else ""
-        self.progress(f"Loading the recognition model{aside}")
+        aside = f" · {known} already known" if known else ""
+        self.steps.send(0.0, "Loading the model" + aside, force=True)
         if self.tagger is None:
             self.tagger = Tagger(*self.wd_files)
-        aside = f" on the {getattr(self.tagger, 'device', 'processor')}{aside}"
+        device = getattr(self.tagger, "device", "processor")
         started = time.monotonic()
         for index, frame in enumerate(todo, 1):
             if self.cancel is not None and self.cancel():
@@ -117,9 +122,8 @@ class Live:
             scores = self.tagger.score_path(frame["image"])
             self.scores.put(frame["image"], scores)
             frame.update(scores)
-            if index == 1 or index % 5 == 0 or index == len(todo):
-                left = time_left(index, len(todo), time.monotonic() - started)
-                self.progress(f"Recognizing {index}/{len(todo)}{aside}" + (f" · {left}" if left else ""))
+            left = time_left(index, len(todo), time.monotonic() - started)
+            self.steps.send(index / len(todo), f"{index}/{len(todo)} images on the {device}{aside}", left)
 
 
 def refresh_utterances(analysis, settings):
@@ -190,13 +194,13 @@ def analyze(snapshot, settings, sources=None, progress=None, cancel=None, store=
     With ``store`` (the cache folder), a finished analysis is saved there and
     the same inputs later load it instead of running anything.
     """
-    progress = progress or (lambda _text: None)
+    steps = Steps(progress)
     key = analysis_key(snapshot, settings) if store is not None else None
     if key is not None:
         found = load_analysis(store, key)
         if found:
             return _for_snapshot(found, snapshot)
-    sources = sources or Live(snapshot.get("cache"), progress, cancel)
+    sources = sources or Live(snapshot.get("cache"), steps, cancel)
     fps = float(snapshot["fps"])
     warnings = list(snapshot.get("warnings") or [])
     clips = list(snapshot.get("video_clips") or [])
@@ -205,14 +209,16 @@ def analyze(snapshot, settings, sources=None, progress=None, cancel=None, store=
     for clip in clips + list(snapshot.get("audio_clips") or []):
         if not _normal_speed(clip.get("speed")):
             warnings.append(f"{clip.get('name') or 'A clip'} is not at normal speed. The alignment may drift.")
+    steps.start(1, clips[0].get("name") or "Video 1")
     strips = [sources.filmstrip(clip) for clip in clips]
-    progress("Finding the shots")
-    shots = build_shots(clips, strips, fps, cancel)
+    steps.start(2, f"{len(clips)} clip(s) on video 1")
+    shots = build_shots(clips, strips, fps, cancel, steps.part(f"{len(clips)} clip(s) on video 1"))
     span, notes = _range_of(snapshot, settings)
     warnings.extend(notes)
     kept = [shot for shot in shots if _overlaps(shot, span)]
     speech_tracks = []
     utterances = []
+    steps.start(3, f"{len(kept)} shots found" if kept else "")
     for clip in snapshot.get("audio_clips") or []:
         audio = sources.waveform(clip, fps)
         expected = (int(clip["end"]) - int(clip["start"])) / fps
@@ -228,6 +234,7 @@ def analyze(snapshot, settings, sources=None, progress=None, cancel=None, store=
     if chosen and hasattr(sources, "score_many"):
         sources.score_many(chosen)
     elif chosen:
+        steps.start(5, f"{len(chosen)} images")
         for frame in chosen:
             if cancel is not None and cancel():
                 raise InterruptedError(STOPPED)

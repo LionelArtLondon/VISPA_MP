@@ -86,7 +86,7 @@ class Silero:
         self.state = np.zeros((2, 1, 128), dtype=np.float32)
         self.context = np.zeros((1, 64), dtype=np.float32)
 
-    def probabilities(self, audio, sample_rate=SAMPLE_RATE, cancel=None):
+    def probabilities(self, audio, sample_rate=SAMPLE_RATE, cancel=None, report=None):
         import numpy as np
         audio = np.asarray(audio, dtype=np.float32).reshape(-1)
         if sample_rate != SAMPLE_RATE:
@@ -96,8 +96,11 @@ class Silero:
             audio = np.pad(audio, (0, WINDOW - len(audio) % WINDOW))
         probs = []
         for start in range(0, len(audio), WINDOW):
-            if cancel is not None and start % (WINDOW * 2000) == 0 and cancel():
-                raise InterruptedError("The analysis was stopped.")
+            if start % (WINDOW * 2000) == 0:
+                if cancel is not None and cancel():
+                    raise InterruptedError("The analysis was stopped.")
+                if report is not None:
+                    report(start / max(1, len(audio)))
             chunk = audio[start:start + WINDOW][None, :]
             model_input = np.concatenate([self.context, chunk], axis=1)
             outputs = self.session.run(None, {

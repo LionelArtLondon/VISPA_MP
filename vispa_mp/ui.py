@@ -10,11 +10,11 @@ from functools import partial
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QPoint, QRect, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap, QPolygon
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPalette, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
     QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QSizePolicy, QSlider, QSpinBox, QStackedWidget, QToolButton, QVBoxLayout,
+    QScrollArea, QSizePolicy, QSlider, QSpinBox, QStackedWidget, QTabWidget, QToolButton, QVBoxLayout,
     QWidget, QMainWindow, QMessageBox,
 )
 
@@ -26,12 +26,14 @@ from vispa_mp.preset import load, load_user, save_user
 from vispa_mp.rules import _cavity, page_goal, propose, target_pages
 from vispa_mp.timebase import format_timecode
 from vispa_mp.ui_tokens import (
-    ACCENT, APP_BG, BAR_BG, CONTROL_BG, HEADER_HEIGHT, MONO_FAMILY, PANEL_BG,
+    ACCENT, APP_BG, BAR_BG, BORDER_ROW, BORDER_STRONG, CONTROL, CONTROL_BG, HEADER_HEIGHT, MONO_FAMILY, PANEL_BG,
     PANEL_TITLE_BG, PLAYHEAD, PRIMARY_BG, RADIUS, SELECTED_ROW, TEXT_FAMILY,
     TEXT_MAIN, TEXT_MUTED, TEXT_SECONDARY, window_stylesheet,
 )
-from vispa_mp.window_chrome import TitleBar, WindowChromeMixin
+from vispa_mp.window_chrome import BORDER_COLOUR, ChromeDialog, TitleBar, WindowChromeMixin
 
+ICONS = Path(__file__).resolve().parent / "icons"
+LINE = "#1F4250"  # the one-pixel line between two surfaces
 SWATCH = {"Green": "#3c8c4a", "Blue": "#2f6fed", "Cyan": "#3ec2d6"}
 MANUAL_DOT = "#8AA0A8"
 COLOR_LABEL = {"Green": "Green", "Blue": "Blue", "Cyan": "Cyan"}
@@ -70,6 +72,69 @@ SPINS = (
     ("total_page_max", "Images per page, ceiling", 1, 40, 1),
     ("candidates_per_line", "Images examined per line", 1, 8, 1),
 )
+
+SPIN_OF = {key: (label, low, high, step) for key, label, low, high, step in SPINS}
+CHECKS = {
+    "require_open_mouth": "Require an open mouth",
+    "keep_second_mouth": "Keep a second mouth",
+    "skip_marked_shots": "Skip shots that already have markers",
+    "use_in_out": "Analyze the In/Out range",
+}
+# Settings window: tab, then sections of (title, keys). "compression" and
+# "mouth_fallback" are built apart; every other key is a spin box or a check box.
+SETTINGS_TABS = (
+    ("Pages", (
+        ("Story length", ("compression", "target_pages_min", "target_pages_max")),
+        ("Images per page", ("core_page_min", "core_page_max", "total_page_min", "total_page_max")),
+        ("New page", ("min_green_frames", "scene_grey", "scene_colour", "group_min")),
+    )),
+    ("Images", (
+        ("Choosing an image", ("end_fraction", "sharpness_ratio", "motion_blur_max", "hold_ratio",
+                               "expression_weight")),
+        ("Spacing", ("min_marker_frames", "duplicate_diff")),
+        ("Action shots", ("action_max_seconds", "action_motion", "action_extras")),
+    )),
+    ("Speech", (
+        ("Lines", ("speech_threshold", "speech_min_silence_ms", "speech_min_duration_ms", "speech_pad_ms")),
+        ("Mouths", ("require_open_mouth", "mouth_fallback", "keep_second_mouth")),
+    )),
+    ("Analysis", (
+        ("What is read", ("use_in_out", "skip_marked_shots")),
+        ("Images examined", ("candidates_per_line",)),
+    )),
+)
+
+
+def _icon(name):
+    return (ICONS / name).as_posix()
+
+
+def separator(vertical=False):
+    """A one-pixel line where two surfaces meet."""
+    line = QFrame()
+    line.setProperty("role", "line")
+    if vertical:
+        line.setFixedWidth(1)
+    else:
+        line.setFixedHeight(1)
+    return line
+
+
+def dark_palette():
+    """Fusion's colours for what the stylesheet does not draw: check boxes, popups, selections."""
+    palette = QPalette()
+    for role, colour in (
+        (QPalette.ColorRole.Window, PANEL_BG), (QPalette.ColorRole.WindowText, TEXT_MAIN),
+        (QPalette.ColorRole.Base, APP_BG), (QPalette.ColorRole.AlternateBase, BAR_BG),
+        (QPalette.ColorRole.Text, TEXT_MAIN), (QPalette.ColorRole.Button, CONTROL_BG),
+        (QPalette.ColorRole.ButtonText, TEXT_MAIN), (QPalette.ColorRole.Highlight, SELECTED_ROW),
+        (QPalette.ColorRole.HighlightedText, "#ffffff"), (QPalette.ColorRole.ToolTipBase, BAR_BG),
+        (QPalette.ColorRole.ToolTipText, TEXT_MAIN), (QPalette.ColorRole.PlaceholderText, TEXT_MUTED),
+    ):
+        palette.setColor(role, QColor(colour))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(TEXT_MUTED))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor(TEXT_MUTED))
+    return palette
 
 
 def group_pages(proposals, manual_frames):
@@ -140,7 +205,7 @@ def motif_of(frame, settings):
 class Worker(QThread):
     done = Signal(object)
     failed = Signal(str)
-    progressed = Signal(str)
+    progressed = Signal(object)  # a text, or a step of an analysis (a dict)
 
     def __init__(self, fn):
         super().__init__()
@@ -151,6 +216,81 @@ class Worker(QThread):
             self.done.emit(self.fn(self.progressed.emit))
         except Exception as error:
             self.failed.emit(str(error))
+
+
+class StepBar(QWidget):
+    """VISPA's loading bar, cut into one segment per step.
+
+    Finished steps are full, the running one fills from the left, the others
+    show their empty track, so the start, the end and the step are all visible.
+    """
+
+    GAP = 3
+
+    def __init__(self):
+        super().__init__()
+        self.steps = 5
+        self.step = 0
+        self.fraction = 0.0
+        self.setFixedSize(220, 10)
+
+    def set_progress(self, step, steps, fraction):
+        self.step, self.steps, self.fraction = int(step), max(1, int(steps)), float(fraction)
+        self.update()
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        width = (self.width() - self.GAP * (self.steps - 1)) / self.steps
+        for index in range(self.steps):
+            x = index * (width + self.GAP)
+            track = QRect(int(round(x)), 0, int(round(width)), self.height())
+            painter.setPen(QPen(QColor(BORDER_ROW), 1))
+            painter.setBrush(QColor(APP_BG))
+            painter.drawRoundedRect(track.adjusted(0, 0, -1, -1), 3, 3)
+            number = index + 1
+            filled = 1.0 if number < self.step else self.fraction if number == self.step else 0.0
+            if filled > 0:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(PRIMARY_BG if number < self.step else ACCENT))
+                painter.drawRoundedRect(QRect(track.x(), 0, max(4, int(track.width() * filled)), self.height()), 3, 3)
+        painter.end()
+
+
+class StepProgress(QWidget):
+    """Bottom left during an analysis: the bar, « 2/5 Finding the shots · 45 % », the detail, the time left."""
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("stepProgress")
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(10)
+        self.bar = StepBar()
+        self.step_label = QLabel("")
+        self.step_label.setObjectName("stepLabel")
+        self.percent = QLabel("")
+        self.percent.setObjectName("stepPercent")
+        self.detail = QLabel("")
+        self.detail.setProperty("role", "muted")
+        self.left = QLabel("")
+        self.left.setObjectName("stepLeft")
+        row.addWidget(self.bar, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(self.step_label)
+        row.addWidget(self.percent)
+        row.addWidget(self.detail)
+        row.addWidget(self.left)
+        self.hide()
+
+    def show_step(self, value):
+        self.bar.set_progress(value["step"], value["steps"], value["fraction"])
+        self.step_label.setText(f"{value['step']}/{value['steps']}  {value['label']}")
+        self.percent.setText(f"{int(value['fraction'] * 100)} %")
+        self.detail.setText(value.get("detail") or "")
+        self.detail.setVisible(bool(value.get("detail")))
+        self.left.setText(value.get("left") or "")
+        self.left.setVisible(bool(value.get("left")))
+        self.show()
 
 
 class MarkerDot(QWidget):
@@ -432,6 +572,9 @@ def _theme():
     QLabel[role="resolveDot"][connected="false"] {{ color: #5C7380; }}
     QLabel[role="resolveDot"][connected="true"] {{ color: {ACCENT}; }}
     QLabel[role="alert"] {{ color: {PLAYHEAD}; font-weight: 700; }}
+    QLabel#stepLabel {{ color: {TEXT_MAIN}; font-weight: 600; }}
+    QLabel#stepPercent {{ color: {ACCENT}; font-family: {MONO_FAMILY}; font-weight: 600; }}
+    QLabel#stepLeft {{ color: {TEXT_MAIN}; }}
     QLabel#playhead, QLabel[role="mono"] {{ font-family: {MONO_FAMILY}; font-size: {TEXT_SECONDARY}px; }}
     QPushButton[role="mode"] {{ background: transparent; border: 0; border-bottom: 2px solid transparent;
         border-radius: 0; color: {TEXT_MUTED}; padding: 0 12px; min-height: 30px; max-height: 30px; }}
@@ -464,6 +607,50 @@ def _theme():
         font-family: 'Segoe UI'; font-size: 13px; font-weight: 400; }}
     QPushButton[chrome="true"]:hover {{ background: #31565d; border: 0; color: #edf5fa; }}
     QPushButton#closeButton:hover {{ background: transparent; color: #edf5fa; }}
+
+    QMainWindow#mainWindow {{ background: {BORDER_COLOUR}; }}
+    QFrame[role="line"] {{ background: {LINE}; border: 0; }}
+    QWidget#header .QWidget, QWidget#footer .QWidget, QWidget#modeBar .QWidget {{ background: transparent; }}
+    QWidget#center .QWidget, QWidget#center QStackedWidget, QWidget#pages .QWidget,
+    QWidget#adjust .QWidget {{ background: transparent; }}
+    QLabel#timelineName {{ color: {TEXT_MAIN}; font-weight: 600; }}
+    QToolButton#settingsButton {{ padding: 0; min-width: {CONTROL - 2}px; max-width: {CONTROL - 2}px;
+        qproperty-iconSize: 16px; }}
+
+    QDialog#chromeDialog {{ background: {BORDER_COLOUR}; }}
+    QWidget#dialogBody, QWidget#settingsHost {{ background: {PANEL_BG}; }}
+    QLabel[role="section"] {{ color: {ACCENT}; font-size: 12px; font-weight: 600; padding: 4px 0 2px 0; }}
+    QTabWidget#settingsTabs::pane {{ border: 0; border-top: 1px solid {LINE}; }}
+    QTabWidget#settingsTabs QTabBar {{ background: {BAR_BG}; }}
+    QTabBar::tab {{ background: transparent; color: {TEXT_MUTED}; border: 0; border-bottom: 2px solid transparent;
+        padding: 8px 16px; margin: 0; }}
+    QTabBar::tab:hover {{ color: {TEXT_MAIN}; }}
+    QTabBar::tab:selected {{ color: {ACCENT}; border-bottom: 2px solid {ACCENT}; font-weight: 600; }}
+
+    QAbstractSpinBox {{ background: {APP_BG}; color: {TEXT_MAIN}; border: 1px solid {BORDER_ROW};
+        border-radius: {RADIUS}px; padding: 0 22px 0 8px; min-height: {CONTROL - 2}px; max-height: {CONTROL - 2}px;
+        selection-background-color: {SELECTED_ROW}; }}
+    QAbstractSpinBox:hover {{ border-color: {BORDER_STRONG}; }}
+    QAbstractSpinBox:focus {{ border-color: {ACCENT}; }}
+    QAbstractSpinBox:disabled {{ color: {TEXT_MUTED}; border-color: #1f3a46; }}
+    QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {{ subcontrol-origin: border; width: 20px;
+        border: 0; background: transparent; }}
+    QAbstractSpinBox::up-button {{ subcontrol-position: top right; }}
+    QAbstractSpinBox::down-button {{ subcontrol-position: bottom right; }}
+    QAbstractSpinBox::up-arrow {{ image: url("{_icon('chevron-up.svg')}"); width: 10px; height: 10px; }}
+    QAbstractSpinBox::up-arrow:hover {{ image: url("{_icon('chevron-up-hover.svg')}"); }}
+    QAbstractSpinBox::down-arrow {{ image: url("{_icon('chevron-down.svg')}"); width: 10px; height: 10px; }}
+    QAbstractSpinBox::down-arrow:hover {{ image: url("{_icon('chevron-down-hover.svg')}"); }}
+    QComboBox::drop-down {{ border: 0; width: 22px; }}
+    QComboBox::down-arrow {{ image: url("{_icon('chevron-down.svg')}"); width: 10px; height: 10px; }}
+    QComboBox QAbstractItemView {{ background: {APP_BG}; color: {TEXT_MAIN}; border: 1px solid {BORDER_STRONG};
+        selection-background-color: {SELECTED_ROW}; outline: 0; }}
+    QCheckBox {{ spacing: 8px; }}
+    QCheckBox::indicator {{ width: 16px; height: 16px; border: 1px solid {BORDER_STRONG}; border-radius: 3px;
+        background: {APP_BG}; }}
+    QCheckBox::indicator:hover {{ border-color: {ACCENT}; }}
+    QCheckBox::indicator:checked {{ background: {PRIMARY_BG}; border-color: {PRIMARY_BG};
+        image: url("{_icon('check.svg')}"); }}
     """
 
 
@@ -515,6 +702,7 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self._build_header())
+        layout.addWidget(separator())
         self.warnings = QLabel("")
         self.warnings.setWordWrap(True)
         self.warnings.setProperty("role", "muted")
@@ -522,13 +710,17 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         self.warnings.hide()
         layout.addWidget(self.warnings)
         layout.addWidget(self._build_modes())
+        layout.addWidget(separator())
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
         body.addWidget(self._build_pages())
+        body.addWidget(separator(vertical=True))
         body.addWidget(self._build_center(), 1)
+        body.addWidget(separator(vertical=True))
         body.addWidget(self._build_adjust())
         layout.addLayout(body, 1)
+        layout.addWidget(separator())
         layout.addWidget(self._build_footer())
         self._build_settings()
         self.read_button.clicked.connect(self.read_timeline)
@@ -539,26 +731,23 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         self.titlebar = TitleBar(self)
         self.titlebar.set_caption("VISPA MP")
         self.setMenuWidget(self.titlebar)
+        self.setObjectName("mainWindow")
+        self._sync_outline()
         self._sync_resolve()
         self._sync_size_fields()
         self._refresh_target()
         self.ruler.set_compact(False)
 
     def _build_header(self):
+        """The toolbar: the three actions, the timeline name, Resolve and Settings."""
         header = QWidget()
         header.setObjectName("header")
         header.setFixedHeight(HEADER_HEIGHT)
         grid = QGridLayout(header)
-        grid.setContentsMargins(12, 0, 12, 0)
+        grid.setContentsMargins(12, 0, 8, 0)
         left = QHBoxLayout()
+        left.setContentsMargins(0, 0, 0, 0)
         left.setSpacing(8)
-        brand = QLabel("VISPA MP")
-        brand.setObjectName("brand")
-        word = QLabel("markers")
-        word.setObjectName("brandWord")
-        left.addWidget(brand)
-        left.addWidget(word)
-        left.addSpacing(12)
         self.read_button = QPushButton("Read timeline")
         self.analyze_button = QPushButton("Analyze")
         self.apply_button = QPushButton("Place markers")
@@ -566,22 +755,28 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         for button in (self.read_button, self.analyze_button, self.apply_button):
             button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
             left.addWidget(button)
-        left_wrap = QWidget()
-        left_wrap.setLayout(left)
         self.timeline_label = QLabel("—")
+        self.timeline_label.setObjectName("timelineName")
         self.timeline_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         right = QHBoxLayout()
+        right.setContentsMargins(0, 0, 0, 0)
         right.setSpacing(6)
         self.resolve_dot = QLabel("●")
         self.resolve_dot.setProperty("role", "resolveDot")
         self.resolve_label = QLabel("Resolve not connected")
         right.addWidget(self.resolve_dot)
         right.addWidget(self.resolve_label)
-        right_wrap = QWidget()
-        right_wrap.setLayout(right)
-        grid.addWidget(left_wrap, 0, 0, Qt.AlignmentFlag.AlignLeft)
+        right.addSpacing(10)
+        self.settings_button = QToolButton()
+        self.settings_button.setObjectName("settingsButton")
+        self.settings_button.setIcon(QIcon(_icon("gear.svg")))
+        self.settings_button.setToolTip("Settings")
+        self.settings_button.setAccessibleName("Settings")
+        self.settings_button.clicked.connect(self._show_settings)
+        right.addWidget(self.settings_button)
+        grid.addLayout(left, 0, 0, Qt.AlignmentFlag.AlignLeft)
         grid.addWidget(self.timeline_label, 0, 1)
-        grid.addWidget(right_wrap, 0, 2, Qt.AlignmentFlag.AlignRight)
+        grid.addLayout(right, 0, 2, Qt.AlignmentFlag.AlignRight)
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(2, 1)
@@ -793,12 +988,6 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         form_layout.addWidget(hand)
         column.addWidget(form)
         column.addStretch(1)
-        self.settings_button = QPushButton("Settings")
-        self.settings_button.clicked.connect(self._show_settings)
-        wrap = QHBoxLayout()
-        wrap.setContentsMargins(12, 0, 12, 0)
-        wrap.addWidget(self.settings_button)
-        column.addLayout(wrap)
         self._show_slider_value("sharpness_floor", self.sharpness_value)
         self._show_slider_value("mouth_min", self.mouth_value)
         return panel
@@ -829,7 +1018,9 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         footer.setFixedHeight(36)
         row = QHBoxLayout(footer)
         row.setContentsMargins(12, 0, 12, 0)
-        self.playhead_label = QLabel("—")
+        self.progress = StepProgress()
+        row.addWidget(self.progress)
+        self.playhead_label = QLabel("")
         self.playhead_label.setObjectName("playhead")
         row.addWidget(self.playhead_label)
         row.addStretch(1)
@@ -843,77 +1034,124 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         return footer
 
     def _build_settings(self):
-        self.settings_dialog = QDialog(self)
-        self.settings_dialog.setWindowTitle("Settings")
-        self.settings_dialog.resize(460, 640)
-        outer = QVBoxLayout(self.settings_dialog)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        host = QWidget()
-        form = QFormLayout(host)
+        self.settings_dialog = ChromeDialog(self, "Settings")
+        self.settings_dialog.resize(500, 600)
+        outer = QVBoxLayout(self.settings_dialog.body)
+        outer.setContentsMargins(0, 0, 0, 16)
+        outer.setSpacing(0)
         values = self._stored_settings
-        story = QWidget()
-        story_layout = QVBoxLayout(story)
-        story_layout.setContentsMargins(0, 0, 0, 0)
-        self.compression = QSlider(Qt.Orientation.Horizontal)
-        self.compression.setRange(0, 100)
-        self.compression.setValue(int(round(float(values["compression"]) * 100)))
-        self.compression.valueChanged.connect(self._changed)
-        self.widgets["compression"] = self.compression
-        ends = QHBoxLayout()
-        ends.addWidget(QLabel("Low"))
-        ends.addStretch(1)
-        ends.addWidget(QLabel("High"))
-        self.page_target = QLabel("")
-        self.page_target.setWordWrap(True)
-        story_layout.addWidget(self.compression)
-        story_layout.addLayout(ends)
-        story_layout.addWidget(self.page_target)
-        form.addRow("Story compression", story)
-        for key, label, low, high, step in SPINS:
-            if key in INTEGERS:
-                widget = QSpinBox()
-                widget.setRange(int(low), int(high))
-                widget.setSingleStep(int(step))
-                widget.setValue(int(values[key]))
-            else:
-                widget = QDoubleSpinBox()
-                widget.setRange(float(low), float(high))
-                widget.setSingleStep(float(step))
-                widget.setDecimals(2)
-                widget.setValue(float(values[key]))
-            widget.valueChanged.connect(self._changed)
-            self.widgets[key] = widget
-            form.addRow(label, widget)
-        mouth = QComboBox()
-        mouth.addItem("Sharp image", "sharp")
-        mouth.addItem("Propose nothing", "none")
-        mouth.setCurrentIndex(max(0, mouth.findData(values["mouth_fallback"])))
-        mouth.currentIndexChanged.connect(self._changed)
-        self.widgets["mouth_fallback"] = mouth
-        form.addRow("If the mouth is not seen", mouth)
-        for key, label in (
-            ("require_open_mouth", "Require an open mouth"),
-            ("keep_second_mouth", "Keep a second mouth"),
-            ("skip_marked_shots", "Skip shots that already have markers"),
-            ("use_in_out", "Analyze the In/Out range"),
-        ):
-            box = QCheckBox(label)
-            box.setChecked(bool(values[key]))
-            box.toggled.connect(self._changed)
-            self.widgets[key] = box
-            form.addRow(box)
-        scroll.setWidget(host)
-        outer.addWidget(scroll, 1)
+        self.settings_tabs = QTabWidget()
+        self.settings_tabs.setObjectName("settingsTabs")
+        self.settings_tabs.setDocumentMode(True)
+        for title, sections in SETTINGS_TABS:
+            self.settings_tabs.addTab(self._settings_page(sections, values), title)
+        outer.addWidget(self.settings_tabs, 1)
+        outer.addSpacing(16)
+        outer.addWidget(separator())
+        outer.addSpacing(14)
         buttons = QHBoxLayout()
+        buttons.setContentsMargins(16, 0, 16, 0)
+        buttons.setSpacing(8)
         self.reset_button = QPushButton("Reset")
+        self.reset_button.setToolTip("Back to the shipped settings. The page format stays.")
         self.download_button = QPushButton("Download models")
         self.reset_button.clicked.connect(self.reset_settings)
         self.download_button.clicked.connect(self.download_models)
         buttons.addWidget(self.reset_button)
+        buttons.addStretch(1)
         buttons.addWidget(self.download_button)
         outer.addLayout(buttons)
+
+    def _settings_page(self, sections, values):
+        scroll = QScrollArea()
+        scroll.setObjectName("settingsScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # The bar paints the viewport's colour behind itself: the same as the page, so it disappears.
+        scroll.viewport().setStyleSheet(f"background: {PANEL_BG};")
+        host = QWidget()
+        host.setObjectName("settingsHost")
+        column = QVBoxLayout(host)
+        column.setContentsMargins(20, 12, 16, 8)
+        column.setSpacing(0)
+        # One form per tab, so every field of the tab lines up on the same edge.
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(8)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+        for index, (title, keys) in enumerate(sections):
+            heading = QLabel(title)
+            heading.setProperty("role", "section")
+            if index:
+                heading.setContentsMargins(0, 12, 0, 0)
+            form.addRow(heading)
+            for key in keys:
+                self._settings_row(form, key, values)
+        column.addLayout(form)
+        column.addStretch(1)
+        scroll.setWidget(host)
+        return scroll
+
+    def _settings_row(self, form, key, values):
+        if key == "compression":
+            story = QWidget()
+            story_layout = QVBoxLayout(story)
+            story_layout.setContentsMargins(0, 0, 0, 0)
+            story_layout.setSpacing(2)
+            self.compression = QSlider(Qt.Orientation.Horizontal)
+            self.compression.setRange(0, 100)
+            self.compression.setMinimumWidth(200)
+            self.compression.setValue(int(round(float(values["compression"]) * 100)))
+            self.compression.valueChanged.connect(self._changed)
+            self.widgets["compression"] = self.compression
+            ends = QHBoxLayout()
+            ends.addWidget(self._muted("Low"))
+            ends.addStretch(1)
+            ends.addWidget(self._muted("High"))
+            self.page_target = QLabel("")
+            self.page_target.setProperty("role", "muted")
+            self.page_target.setWordWrap(True)
+            story_layout.addWidget(self.compression)
+            story_layout.addLayout(ends)
+            story_layout.addWidget(self.page_target)
+            form.addRow("Story compression", story)
+            return
+        if key == "mouth_fallback":
+            mouth = QComboBox()
+            mouth.addItem("Sharp image", "sharp")
+            mouth.addItem("Propose nothing", "none")
+            mouth.setCurrentIndex(max(0, mouth.findData(values["mouth_fallback"])))
+            mouth.currentIndexChanged.connect(self._changed)
+            mouth.setFixedWidth(150)
+            self.widgets["mouth_fallback"] = mouth
+            form.addRow("If the mouth is not seen", mouth)
+            return
+        if key in CHECKS:
+            box = QCheckBox(CHECKS[key])
+            box.setChecked(bool(values[key]))
+            box.toggled.connect(self._changed)
+            self.widgets[key] = box
+            form.addRow(box)
+            return
+        label, low, high, step = SPIN_OF[key]
+        if key in INTEGERS:
+            widget = QSpinBox()
+            widget.setRange(int(low), int(high))
+            widget.setSingleStep(int(step))
+            widget.setValue(int(values[key]))
+        else:
+            widget = QDoubleSpinBox()
+            widget.setRange(float(low), float(high))
+            widget.setSingleStep(float(step))
+            widget.setDecimals(2)
+            widget.setValue(float(values[key]))
+        widget.setFixedWidth(110)
+        widget.valueChanged.connect(self._changed)
+        self.widgets[key] = widget
+        form.addRow(label, widget)
 
     def _muted(self, text):
         label = QLabel(text)
@@ -1581,14 +1819,24 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         if self.worker is not None:
             return
         self.worker = Worker(fn)
-        self.worker.progressed.connect(self.status.setText)
+        self.worker.progressed.connect(self._on_progress)
         self.worker.failed.connect(self._failed)
         self.worker.done.connect(done)
         self.worker.finished.connect(self._worker_finished)
         self.worker.start()
 
+    def _on_progress(self, value):
+        if isinstance(value, dict):
+            self.progress.show_step(value)
+            self.playhead_label.hide()
+            self.status.setText("")
+        else:
+            self.status.setText(str(value))
+
     def _worker_finished(self):
         self.worker = None
+        self.progress.hide()
+        self.playhead_label.show()
         if self._stop_analysis is not None:
             self._stop_analysis = None
             self.analyze_button.setText("Analyze")
@@ -1721,6 +1969,17 @@ class MainWindow(WindowChromeMixin, QMainWindow):
 
         self._start(work, done)
 
+    def _sync_outline(self):
+        framed = not (self.isMaximized() or self.isFullScreen())
+        margin = 1 if framed else 0
+        if self.contentsMargins().left() != margin:
+            self.setContentsMargins(margin, margin, margin, margin)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            self._sync_outline()
+
     def closeEvent(self, event):
         if self._save_timer.isActive():
             self.save_settings()
@@ -1737,6 +1996,8 @@ def run():
     except OSError:
         pass
     app = QApplication.instance() or QApplication([])
+    app.setStyle("Fusion")
+    app.setPalette(dark_palette())
     install_scrollbar_style(app)
     window = MainWindow()
     window.show()

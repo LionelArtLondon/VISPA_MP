@@ -7,7 +7,9 @@ import sys
 
 from PySide6.QtCore import QEvent, QPoint, QRectF, Qt
 from PySide6.QtGui import QColor, QPainter
-from PySide6.QtWidgets import QAbstractButton, QFrame, QHBoxLayout, QLabel, QMenuBar, QPushButton, QWidget
+from PySide6.QtWidgets import (
+    QAbstractButton, QDialog, QFrame, QHBoxLayout, QLabel, QMenuBar, QPushButton, QVBoxLayout, QWidget,
+)
 from shiboken6 import isValid
 
 # WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX
@@ -17,6 +19,31 @@ TITLEBAR_MINIMIZE = "─"
 TITLEBAR_MAXIMIZE = "⛶"
 TITLEBAR_RESTORE = "❐"
 TITLEBAR_CLOSE = "X"
+# The window's outline: the teal of the main button. Windows 11 draws one pixel
+# along the rounded corners, the window paints one more inside: two in all.
+BORDER_COLOUR = "#1FB5A7"
+
+
+def _colorref(colour):
+    red, green, blue = (int(colour[index:index + 2], 16) for index in (1, 3, 5))
+    return red | (green << 8) | (blue << 16)
+
+
+def round_and_outline(widget, colour=BORDER_COLOUR):
+    """Windows 11: rounded corners and a coloured one-pixel border. False elsewhere."""
+    if sys.platform != "win32" or sys.getwindowsversion().build < 22000:
+        return False
+    from PySide6.QtWidgets import QApplication
+    if QApplication.platformName() != "windows":
+        return False
+    import ctypes
+    from ctypes import wintypes
+    hwnd = wintypes.HWND(int(widget.winId()))
+    rounding = ctypes.c_int(2)  # DWMWCP_ROUND
+    rounded = ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(rounding), ctypes.sizeof(rounding)) == 0
+    border = ctypes.c_uint(_colorref(colour) if colour else 0xFFFFFFFE)  # DWMWA_BORDER_COLOR
+    ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 34, ctypes.byref(border), ctypes.sizeof(border))
+    return rounded
 
 
 class TitlebarCloseButton(QPushButton):
@@ -179,13 +206,7 @@ class WindowChromeMixin:
             self._native_frame_ready = True
             self._native_hwnd = int(self.winId())
             self._add_native_frame(frame_changed=False)
-            if sys.getwindowsversion().build >= 22000:
-                rounding = ctypes.c_int(2)  # DWMWCP_ROUND
-                self._rounded_native = ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                    hwnd, 33, ctypes.byref(rounding), ctypes.sizeof(rounding)) == 0
-                border = ctypes.c_uint(0xFFFFFFFE)  # DWMWA_COLOR_NONE
-                ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                    hwnd, 34, ctypes.byref(border), ctypes.sizeof(border))
+            self._rounded_native = round_and_outline(self)
             user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x0027)
             if self._screen_window is not self.windowHandle():
                 self._screen_window = self.windowHandle()
@@ -317,3 +338,61 @@ class WindowChromeMixin:
             self._check_native_frame_later()
         if getattr(self, "titlebar", None):
             self.titlebar.sync_window_state()
+
+
+class DialogTitleBar(QFrame):
+    """The same 30 px caption for a dialog: its title and a close button. Dragging moves it."""
+
+    def __init__(self, dialog, title):
+        super().__init__(dialog)
+        self.owner = dialog
+        self.setObjectName("titlebar")
+        self.setFixedHeight(30)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        row.addSpacing(40)
+        self.brand = QLabel(title, self)
+        self.brand.setObjectName("caption")
+        self.brand.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.brand.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        row.addWidget(self.brand, 1)
+        self.close_button = TitlebarCloseButton()
+        self.close_button.setText(TITLEBAR_CLOSE)
+        self.close_button.setToolTip("Close")
+        self.close_button.setAccessibleName("Close")
+        self.close_button.setObjectName("closeButton")
+        self.close_button.setProperty("chrome", True)
+        self.close_button.setFixedSize(40, 30)
+        self.close_button.setAutoDefault(False)
+        self.close_button.clicked.connect(dialog.close)
+        row.addWidget(self.close_button)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.childAt(event.position().toPoint()) is not self.close_button:
+            handle = self.owner.windowHandle()
+            if handle:
+                handle.startSystemMove()
+        super().mousePressEvent(event)
+
+
+class ChromeDialog(QDialog):
+    """A dialog with VISPA's caption instead of the Windows one. Content goes in ``body``."""
+
+    def __init__(self, parent, title):
+        super().__init__(parent)
+        self.setObjectName("chromeDialog")
+        self.setWindowTitle(title)
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(1, 1, 1, 1)  # the inner pixel of the outline
+        outer.setSpacing(0)
+        self.titlebar = DialogTitleBar(self, title)
+        outer.addWidget(self.titlebar)
+        self.body = QWidget(self)
+        self.body.setObjectName("dialogBody")
+        outer.addWidget(self.body, 1)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        round_and_outline(self)

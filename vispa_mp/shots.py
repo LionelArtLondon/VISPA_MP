@@ -49,16 +49,19 @@ def _is_cut(changes, recent):
             or (changes[2] >= shape_level and changes[2] >= shape_ratio * max(usual[2], 0.03)))
 
 
-def cut_records(frames, cancel=None):
+def cut_records(frames, cancel=None, report=None):
     """One record per accepted cut: index, time_us, grey, colour, shape.
 
     ``frames`` is ``(time µs, small RGB picture)`` in order. ``index`` is that order.
     """
     records, last_cut, previous = [], None, None
     recent = ([], [], [])
+    total = max(1, len(frames))
     for index, (time_us, picture) in enumerate(frames):
         if cancel is not None and cancel():
             raise InterruptedError("Shot search was stopped.")
+        if report is not None and index % 250 == 0:
+            report(index / total)
         now = measures(picture)
         if previous is not None:
             changes = _changes(previous, now)
@@ -151,7 +154,7 @@ def _collapse_frames(frames):
     return [by_frame[key] for key in sorted(by_frame)]
 
 
-def build_shots(clips, strips, timeline_fps, cancel=None):
+def build_shots(clips, strips, timeline_fps, cancel=None, report=None):
     """Shots on video 1. A clip edge is a cut; a long clip is also cut inside.
 
     ``strips[i]`` is the RGB filmstrip of ``clips[i]``, one picture per source frame
@@ -160,14 +163,16 @@ def build_shots(clips, strips, timeline_fps, cancel=None):
     shots = []
     previous = None
     first = True
-    for clip, strip in zip(clips, strips):
+    count = max(1, len(clips))
+    for number, (clip, strip) in enumerate(zip(clips, strips)):
+        part = None if report is None else (lambda fraction, number=number: report((number + fraction) / count))
         pictures = np.asarray(strip)
         if pictures.size == 0:
             continue
         source_fps = float(clip.get("fps") or timeline_fps)
         frame_us = max(1, int(round(1_000_000 / source_fps)))
         timed = [(index * frame_us, pictures[index]) for index in range(len(pictures))]
-        records = {record["index"]: record for record in cut_records(timed, cancel)}
+        records = {record["index"]: record for record in cut_records(timed, cancel, part)}
         boundaries = [0] + sorted(records) + [len(pictures)]
         for start_index, end_index in zip(boundaries, boundaries[1:]):
             if end_index <= start_index:

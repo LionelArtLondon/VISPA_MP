@@ -106,10 +106,19 @@ class _Ffmpeg:
         return False
 
 
-def _run(command, cancel=None):
+def _run(command, cancel=None, expected=0, report=None):
+    """All of ffmpeg's output. With ``expected`` bytes, ``report`` gets how far it is."""
+    chunks, received = [], 0
     with _Ffmpeg(command, cancel) as run:
-        output = run.stdout.read()
-    return output
+        while True:
+            chunk = run.stdout.read(1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            received += len(chunk)
+            if report is not None and expected:
+                report(received / expected)
+    return b"".join(chunks)
 
 
 def _read_exactly(stream, size):
@@ -136,7 +145,7 @@ def ppm_frames(stream):
         yield np.frombuffer(data, dtype=np.uint8).reshape(height, width, 3)
 
 
-def load_filmstrip(clip, cache, binary=None, cancel=None):
+def load_filmstrip(clip, cache, binary=None, cancel=None, report=None):
     """64×36 RGB pictures for every source frame of the clip, cached."""
     binary = binary or ffmpeg_path()
     start = int(clip.get("source_start") or 0)
@@ -152,8 +161,8 @@ def load_filmstrip(clip, cache, binary=None, cancel=None):
     command = [binary, "-hide_banner", "-loglevel", "error", "-i", clip["path"],
                "-vf", f"select='between(n,{start},{end})',scale={WIDTH}:{HEIGHT}:flags=bilinear",
                *_rate_args(binary), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
-    raw = _run(command, cancel)
     frame_bytes = WIDTH * HEIGHT * 3
+    raw = _run(command, cancel, count * frame_bytes, report)
     got = len(raw) // frame_bytes
     if got <= 0:
         raise RuntimeError(f"No picture was read from {clip['path']}.")
@@ -162,7 +171,7 @@ def load_filmstrip(clip, cache, binary=None, cancel=None):
     return frames
 
 
-def load_waveform(clip, timeline_fps, cache, binary=None, cancel=None):
+def load_waveform(clip, timeline_fps, cache, binary=None, cancel=None, report=None):
     """Mono float32 at 16 kHz, starting at the clip's first timeline frame."""
     binary = binary or ffmpeg_path()
     source_fps = float(clip.get("fps") or timeline_fps)
@@ -176,7 +185,7 @@ def load_waveform(clip, timeline_fps, cache, binary=None, cancel=None):
     command = [binary, "-hide_banner", "-loglevel", "error", "-i", clip["path"],
                "-ss", f"{start_sec:.6f}", "-t", f"{duration:.6f}",
                "-ac", "1", "-ar", "16000", "-f", "f32le", "pipe:1"]
-    raw = _run(command, cancel)
+    raw = _run(command, cancel, int(duration * 16000) * 4, report)
     audio = np.frombuffer(raw, dtype=np.float32).copy() if raw else np.zeros(0, dtype=np.float32)
     np.save(stored, audio)
     return audio
@@ -190,7 +199,7 @@ def _save_still(picture, destination):
     os.replace(partial, destination)
 
 
-def extract_stills(frames, cache, binary=None, cancel=None, progress=None):
+def extract_stills(frames, cache, binary=None, cancel=None, report=None):
     """One JPEG per candidate, 448 px wide.
 
     Each media file is decoded once, from the first wanted frame to the last.
@@ -198,12 +207,13 @@ def extract_stills(frames, cache, binary=None, cancel=None, progress=None):
     so there is no limit on how many stills one pass can write.
     """
     binary = binary or ffmpeg_path()
-    progress = progress or (lambda _text: None)
+    report = report or (lambda _fraction, _detail: None)
     cache = Path(cache) / "stills"
     cache.mkdir(parents=True, exist_ok=True)
     groups = {}
     for frame in frames:
         groups.setdefault(frame["media"], []).append(frame)
+    wanted = {}
     for media, items in groups.items():
         pending = {}
         for frame in items:
@@ -212,14 +222,17 @@ def extract_stills(frames, cache, binary=None, cancel=None, progress=None):
             frame["image"] = str(dest)
             if not dest.is_file():
                 pending.setdefault(number, dest)
+        wanted[media] = pending
+    total = sum(len(pending) for pending in wanted.values())
+    written = 0
+    for media, pending in wanted.items():
         if not pending:
             continue
         first, last = min(pending), max(pending)
         command = [binary, "-hide_banner", "-loglevel", "error", "-i", media,
                    "-vf", f"select='between(n,{first},{last})',scale={STILL_WIDTH}:-2",
                    *_rate_args(binary), "-f", "image2pipe", "-c:v", "ppm", "pipe:1"]
-        written = 0
-        name = Path(media).name
+        before = written
         with _Ffmpeg(command, cancel) as run:
             for offset, picture in enumerate(ppm_frames(run.stdout)):
                 number = first + offset
@@ -227,10 +240,9 @@ def extract_stills(frames, cache, binary=None, cancel=None, progress=None):
                 if dest is not None:
                     _save_still(picture, dest)
                     written += 1
-                    if written == 1 or written % 25 == 0:
-                        progress(f"Images from {name}: {written}/{len(pending)}")
+                    report(written / total, f"{written}/{total} images")
                 if number >= last:
                     run.stop()
                     break
-        if written != len(pending):
-            raise RuntimeError(f"{written} images extracted for {len(pending)} requested in {media}.")
+        if written - before != len(pending):
+            raise RuntimeError(f"{written - before} images extracted for {len(pending)} requested in {media}.")

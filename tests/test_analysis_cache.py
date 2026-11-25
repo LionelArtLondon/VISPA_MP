@@ -12,6 +12,7 @@ from vispa_mp import analyze as analyze_module
 from vispa_mp.analyze import Live, analysis_key, analyze, saved_analysis, time_left
 from vispa_mp.frames import extract_stills, ffmpeg_path
 from vispa_mp.preset import DEFAULTS
+from vispa_mp.progress import Steps
 from vispa_mp.store import ScoreStore
 
 try:
@@ -84,7 +85,7 @@ class _Tagger:
 def _live(tmp_path, cancel=None):
     live = Live.__new__(Live)
     live.cache = tmp_path
-    live.progress = lambda _text: None
+    live.steps = Steps()
     live.cancel = cancel
     live.tagger = _Tagger()
     live.wd_files = None
@@ -214,3 +215,38 @@ def test_silero_stays_on_the_processor(monkeypatch):
                         lambda: ["DmlExecutionProvider", "CPUExecutionProvider"])
     assert providers() == ["DmlExecutionProvider", "CPUExecutionProvider"]
     assert providers(gpu=False) == ["CPUExecutionProvider"]
+
+
+def test_an_analysis_reports_its_steps_in_order(tmp_path):
+    media = tmp_path / "episode.mp4"
+    media.write_bytes(b"video")
+    seen = []
+    analyze(_snapshot(media), dict(DEFAULTS), sources=_Sources(), progress=seen.append)
+    steps = [value["step"] for value in seen]
+    assert steps == sorted(steps) and steps[0] == 1 and steps[-1] == 5
+    assert all(value["steps"] == 5 and 0 <= value["fraction"] <= 1 for value in seen)
+    assert seen[0]["label"] == "Reading the video"
+
+
+def test_steps_are_sent_at_most_ten_times_a_second():
+    seen = []
+    steps = Steps(seen.append)
+    steps.start(2)
+    for index in range(1000):
+        steps.send(index / 1000)
+    steps.send(1.0)
+    assert len(seen) <= 4
+    assert seen[-1]["fraction"] == 1.0
+
+
+def test_the_footer_shows_the_step_then_hides(qapp):
+    from vispa_mp.ui import MainWindow
+    window = MainWindow(client=None)
+    window._on_progress({"step": 5, "steps": 5, "label": "Recognizing the images", "fraction": 0.42,
+                         "detail": "1240/3100 images on the graphics card", "left": "about 3 min left"})
+    assert not window.progress.isHidden()
+    assert window.progress.step_label.text() == "5/5  Recognizing the images"
+    assert window.progress.percent.text() == "42 %"
+    assert window.progress.left.text() == "about 3 min left"
+    window._worker_finished()
+    assert window.progress.isHidden()
