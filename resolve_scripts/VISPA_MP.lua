@@ -457,50 +457,50 @@ local function dispatch(command, timeline)
   error("Unknown command: " .. tostring(name))
 end
 
-local function read_file(path)
-  local file = io.open(path, "rb")
-  if not file then return nil end
-  local text = file:read("*a")
-  file:close()
-  return text
+-- Transport. A script started from Workspace > Scripts gets no io, no ffi,
+-- no require and no os.remove. It can still read a Lua file (loadfile) and save
+-- Fusion's preferences to any path (SetData + SavePrefs). VISPA MP writes
+-- request.lua; the script answers through the VispaMP block of link.prefs.
+local DATA = "VispaMP"
+local REQUEST_FILE = MAILBOX .. "\\request.lua"
+local LINK_PREFS = MAILBOX .. "\\link.prefs"
+local RESPONSE_SECONDS = 5
+local FUSION = nil
+
+local function hex(text)
+  return (text:gsub(".", function(char) return string.format("%02x", string.byte(char)) end))
 end
 
-local function write_atomic(path, text)
-  local temporary = path .. ".tmp"
-  local file = io.open(temporary, "wb")
-  if not file then error("Cannot write " .. temporary) end
-  file:write(text)
-  file:close()
-  os.remove(path)
-  if not os.rename(temporary, path) then
-    error("Cannot replace " .. path)
-  end
+local function set_data(key, value)
+  FUSION:SetData(key and (DATA .. "." .. key) or DATA, value)
 end
 
-local function ensure_dir()
-  if bmd and bmd.createdir then
-    local parent = MAILBOX:match("^(.*)\\[^\\]+$")
-    if parent then pcall(function() bmd.createdir(parent) end) end
-    pcall(function() bmd.createdir(MAILBOX) end)
-  end
+local function get_data(key)
+  return FUSION:GetData(DATA .. "." .. key)
+end
+
+local function publish()
+  FUSION:SavePrefs(LINK_PREFS)
 end
 
 local function write_status(running, name)
-  ensure_dir()
-  write_atomic(MAILBOX .. "\\status.json", encode({
+  set_data("Status", hex(encode({
     running = running and true or false,
     at = os.time(),
     timeline = name or "",
     owner = OWNER,
     started = STARTED,
-  }))
+  })))
+  publish()
 end
 
-local function read_status()
-  local text = read_file(MAILBOX .. "\\status.json")
-  if not text or text == "" then return nil end
-  local ok, status = pcall(decode, text)
-  if ok and type(status) == "table" then return status end
+local function read_request()
+  local chunk = loadfile(REQUEST_FILE)
+  if type(chunk) ~= "function" then return nil end
+  local ok, text = pcall(chunk)
+  if not ok or type(text) ~= "string" or text == "" then return nil end
+  local decoded, request = pcall(decode, text)
+  if decoded and type(request) == "table" then return request end
   return nil
 end
 
@@ -512,23 +512,17 @@ local function is_stale(request, now)
   return now - sent / 1e9 > STALE_SECONDS
 end
 
--- True when another copy of this script started later and now owns the mailbox.
-local function replaced_by_newer(status, owner, started)
-  if type(status) ~= "table" or status.running ~= true then return false end
-  local other = tostring(status.owner or "")
-  if other == "" or other == owner then return false end
-  local other_started = tonumber(status.started) or 0
-  if other_started ~= started then return other_started > started end
-  return other > owner
-end
+-- The script cannot delete request.lua, so it remembers what it answered.
+-- VISPA MP deletes the file once it has the answer.
+local last_id = nil
+local response_at = nil
 
 local function handle_once()
-  local path = MAILBOX .. "\\request.json"
-  local text = read_file(path)
-  if not text or text == "" then return false end
-  local decoded, request = pcall(decode, text)
-  os.remove(path)
-  if not decoded or type(request) ~= "table" then return false end
+  local request = read_request()
+  if not request then return false end
+  local id = tostring(request.id or "")
+  if id == last_id then return false end
+  last_id = id
   if is_stale(request, os.time()) then return false end
   local ran, result = pcall(function()
     local timeline = nil
@@ -538,24 +532,17 @@ local function handle_once()
   local response
   if ran then response = { id = request.id, ok = true, result = result }
   else response = { id = request.id, ok = false, error = tostring(result) } end
-  write_atomic(MAILBOX .. "\\response.json", encode(response))
+  set_data("Response", hex(encode(response)))
+  response_at = os.time()
   return true, ran and request.cmd == "stop", tostring(request.cmd or "")
 end
 
--- Waits without a window. bmd.wait is Fusion's own pause; the Windows Sleep call
--- through LuaJIT's ffi is the fallback. Spinning on os.clock is the last resort.
+-- Waits without a window. bmd.wait is Fusion's own pause. Spinning on
+-- os.clock is the last resort.
 local function pick_sleep()
   local found, wait = pcall(function() return bmd and bmd.wait end)
   if found and type(wait) == "function" then
     return function(seconds) bmd.wait(seconds) end, "bmd.wait"
-  end
-  local loaded, ffi = pcall(require, "ffi")
-  if loaded and type(ffi) == "table" then
-    pcall(ffi.cdef, "void Sleep(unsigned long milliseconds);")
-    local linked = pcall(function() return ffi.C.Sleep end)
-    if linked then
-      return function(seconds) ffi.C.Sleep(math.floor(seconds * 1000)) end, "Sleep"
-    end
   end
   return function(seconds)
     local stop = os.clock() + seconds
@@ -582,15 +569,10 @@ local function self_check()
     0, 10)
   assert(delete[1] == 2 and add[1].frame == 3 and skipped[1] == 1)
   assert(dispatch({ cmd = "stop" }, nil).stopping == true)
-  assert(replaced_by_newer(nil, "10-1", 10) == false)
-  assert(replaced_by_newer({ running = true, owner = "10-1", started = 10 }, "10-1", 10) == false)
-  assert(replaced_by_newer({ running = true, owner = "11-1", started = 11 }, "10-1", 10) == true)
-  assert(replaced_by_newer({ running = true, owner = "9-1", started = 9 }, "10-1", 10) == false)
-  assert(replaced_by_newer({ running = false, owner = "11-1", started = 11 }, "10-1", 10) == false)
-  assert(replaced_by_newer({ running = true }, "10-1", 10) == false)
   assert(is_stale({ id = "1700000000000000000" }, 1700000000 + 301) == true)
   assert(is_stale({ id = "1700000000000000000" }, 1700000000 + 10) == false)
   assert(is_stale({ id = "abc" }, 1700000000) == false)
+  assert(hex("A{\n") == "417b0a")
   local sleep, how = pick_sleep()
   sleep(0.01)
   print("vispa-mp sleep: " .. how)
@@ -600,7 +582,10 @@ end
 local function serve()
   -- No window: a script window is a Studio feature and the free edition stops on it.
   local sleep, how = pick_sleep()
-  local ok, err = pcall(write_status, true, timeline_name())
+  local ok, err = pcall(function()
+    set_data("Owner", OWNER)
+    write_status(true, timeline_name())
+  end)
   if not ok then
     print("VISPA MP: " .. tostring(err))
     return
@@ -612,7 +597,9 @@ local function serve()
   local beat = os.time()
   local reason = nil
   while reason == nil do
-    if replaced_by_newer(read_status(), OWNER, STARTED) then
+    -- Running the script again starts a new copy; the newest one owns the link.
+    local owner_ok, owner = pcall(get_data, "Owner")
+    if owner_ok and owner ~= OWNER then
       reason = "a newer VISPA_MP took over"
     else
       local handled, stopping, command = false, false, ""
@@ -623,8 +610,14 @@ local function serve()
       if stopping then
         reason = "VISPA MP asked it to stop"
         pcall(write_status, false, "")
+        -- Leave nothing behind in Resolve's own preferences.
+        pcall(set_data, nil, nil)
       else
         local now = os.time()
+        if response_at and not handled and now - response_at > RESPONSE_SECONDS then
+          pcall(set_data, "Response", nil)
+          response_at = nil
+        end
         if handled or now ~= beat then
           pcall(write_status, true, timeline_name())
           beat = now
@@ -639,9 +632,28 @@ local function serve()
   print("VISPA MP: stopped (" .. reason .. ").")
 end
 
-if not resolve then
+-- The Console defines `resolve`. Workspace > Scripts often gives only `app`
+-- (Fusion), which hands out Resolve through GetResolve.
+local function find_resolve()
+  if resolve then return resolve end
+  for _, host in ipairs({ app or false, fusion or false, fu or false }) do
+    if host then
+      local value = call(host, "GetResolve")
+      if value then return value end
+    end
+  end
+  return nil
+end
+
+local host = find_resolve()
+if not host then
   self_check()
   return
 end
-
+resolve = host
+FUSION = fusion or app or fu or call(host, "Fusion")
+if not FUSION then
+  print("VISPA MP: Fusion is not reachable from this script, so it cannot talk to VISPA MP.")
+  return
+end
 serve()

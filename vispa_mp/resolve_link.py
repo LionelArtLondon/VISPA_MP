@@ -1,12 +1,19 @@
 """File mailbox between VISPA MP and a script running inside Resolve.
 
 The free edition refuses an outside fusionscript connection. A script started
-from Workspace > Scripts can still read and write the open timeline. Both
-sides exchange one JSON file at a time in cache/resolve_link.
+from Workspace > Scripts can still read and write the open timeline, but it
+has no io library: it cannot write a file the ordinary way. So:
+
+- VISPA MP writes ``request.lua`` (``return [[json]]``). The script reads it
+  with ``loadfile``.
+- The script stores hex-encoded JSON with ``fusion:SetData`` and saves
+  Fusion's preferences to ``link.prefs`` with ``SavePrefs``. VISPA MP reads
+  the ``VispaMP`` block of that file: ``Status`` (heartbeat) and ``Response``.
 """
 
 import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -47,6 +54,8 @@ def install_resolve_script(folder=None):
     if destination is None:
         return None
     destination.mkdir(parents=True, exist_ok=True)
+    # The script cannot create folders: its mailbox must exist before it runs.
+    mailbox_dir().mkdir(parents=True, exist_ok=True)
     target = destination / SCRIPT_NAME
     text = launcher_source()
     if not target.is_file() or target.read_text(encoding="utf-8") != text:
@@ -58,14 +67,65 @@ def install_resolve_script(folder=None):
     return target
 
 
+REQUEST_FILE = "request.lua"
+LINK_FILE = "link.prefs"
+_BLOCK = re.compile(r"\bVispaMP\s*=\s*\{([^{}]*)\}")
+_FIELD = re.compile(r'\b(\w+)\s*=\s*"([0-9a-fA-F]*)"')
+_REQUEST = re.compile(r"\Areturn \[(=*)\[(.*)\]\1\]\s*\Z", re.S)
+
+
+def lua_long_string(text):
+    """`return [==[text]==]` with a bracket level the text does not contain."""
+    level = 0
+    while f"]{'=' * level}]" in text:
+        level += 1
+    eq = "=" * level
+    return f"return [{eq}[{text}]{eq}]\n"
+
+
+def parse_request(text):
+    match = _REQUEST.match(text or "")
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(2))
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def parse_link(text):
+    """The hex fields of the VispaMP block, decoded. Empty when unreadable."""
+    match = _BLOCK.search(text or "")
+    if not match:
+        return {}
+    fields = {}
+    for name, value in _FIELD.findall(match.group(1)):
+        try:
+            fields[name] = json.loads(bytes.fromhex(value).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+    return fields
+
+
+def render_link(fields):
+    """What SavePrefs would write, reduced to the VispaMP block."""
+    lines = []
+    for name, payload in sorted(fields.items()):
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8").hex()
+        lines.append(f'\t\t\t\t{name} = "{encoded}",')
+    body = "\n".join(lines)
+    return "{\n\tGlobal = {\n\t\tScript = {\n\t\t\tVispaMP = {\n" + body + "\n\t\t\t},\n\t\t},\n\t},\n}\n"
+
+
 class Link:
-    """One request file, one response file, and a short heartbeat."""
+    """request.lua one way, link.prefs (status and response) the other."""
 
     def __init__(self, folder=None):
         self.folder = Path(folder) if folder is not None else mailbox_dir()
 
     def running(self, max_age=5.0):
-        status = self._read("status.json")
+        status = self.status()
         if not status or not status.get("running"):
             return False
         try:
@@ -75,58 +135,76 @@ class Link:
         return age <= max_age
 
     def status(self):
-        return self._read("status.json")
+        return self._fields().get("Status")
 
+    def read_response(self):
+        return self._fields().get("Response")
+
+    def write_request(self, message):
+        self._write(REQUEST_FILE, lua_long_string(json.dumps(message, ensure_ascii=False)))
+
+    def pending_request(self):
+        return parse_request(self._text(REQUEST_FILE))
+
+    def take_request(self):
+        payload = self.pending_request()
+        self._unlink(REQUEST_FILE)
+        return payload
+
+    def clear_request(self, message_id=None):
+        """Delete request.lua, but only if it still holds this request."""
+        if message_id is not None:
+            waiting = self.pending_request()
+            if not waiting or waiting.get("id") != message_id:
+                return
+        self._unlink(REQUEST_FILE)
+
+    # The Python host (resolve_scripts/VISPA_MP.py) answers through the same file.
     def write_status(self, running, timeline="", owner=None, started=None):
         payload = {"running": bool(running), "at": time.time(), "timeline": timeline or ""}
         if owner is not None:
             payload["owner"] = owner
             payload["started"] = started
-        self._write("status.json", payload)
-
-    def write_request(self, message):
-        self._write("request.json", message)
-
-    def take_request(self):
-        return self._take("request.json")
+        self._update_link("Status", payload)
 
     def write_response(self, message):
-        self._write("response.json", message)
+        self._update_link("Response", message)
 
-    def read_response(self):
-        return self._read("response.json")
+    def _update_link(self, name, payload):
+        fields = self._fields()
+        fields[name] = payload
+        self._write(LINK_FILE, render_link(fields))
 
-    def clear_response(self):
-        self._unlink("response.json")
+    def _fields(self):
+        return parse_link(self._text(LINK_FILE))
 
     def _path(self, name):
         return self.folder / name
 
-    def _write(self, name, payload):
+    def _text(self, name):
+        try:
+            return self._path(name).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def _write(self, name, text):
         self.folder.mkdir(parents=True, exist_ok=True)
         target = self._path(name)
         temporary = target.with_suffix(target.suffix + ".tmp")
-        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        os.replace(temporary, target)
-
-    def _read(self, name):
-        path = self._path(name)
-        if not path.is_file():
-            return None
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
-
-    def _take(self, name):
-        payload = self._read(name)
-        self._unlink(name)
-        return payload
+        temporary.write_text(text, encoding="utf-8")
+        # Windows refuses to replace a file the other side is reading right now.
+        for attempt in range(40):
+            try:
+                os.replace(temporary, target)
+                return
+            except PermissionError:
+                if attempt == 39:
+                    raise
+                time.sleep(0.01)
 
     def _unlink(self, name):
-        path = self._path(name)
         try:
-            path.unlink()
+            self._path(name).unlink()
         except OSError:
             pass
 
@@ -153,24 +231,19 @@ class MailboxClient:
     def request(self, cmd, **payload):
         with self.lock:
             message = {"id": str(time.time_ns()), "cmd": cmd, **payload}
-            self.link.clear_response()
             self.link.write_request(message)
             deadline = time.time() + self.timeout
             while time.time() < deadline:
                 answer = self.link.read_response()
                 if answer and answer.get("id") == message["id"]:
+                    self.link.clear_request(message["id"])
                     if not answer.get("ok"):
                         raise RuntimeError(answer.get("error") or "Resolve refused the command.")
                     return answer.get("result")
                 time.sleep(0.05)
-            self._withdraw(message["id"])
+            # A script started later must not run a command the user gave up on.
+            self.link.clear_request(message["id"])
             raise RuntimeError("VISPA_MP did not answer." + FREE_HINT)
-
-    def _withdraw(self, message_id):
-        """A script started later must not run a command the user gave up on."""
-        waiting = self.link._read("request.json")
-        if waiting and waiting.get("id") == message_id:
-            self.link._unlink("request.json")
 
     def ping(self):
         return self.request("ping")

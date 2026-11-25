@@ -10,7 +10,7 @@ import pytest
 from tests.test_bridge import Timeline
 from tests.test_link import _Resolve
 from vispa_mp.resolve_host import handle_once, is_stale, replaced_by_newer, serve
-from vispa_mp.resolve_link import Link, MailboxClient, launcher_source, stop_link
+from vispa_mp.resolve_link import Link, MailboxClient, launcher_source, parse_link, stop_link
 
 FUSCRIPT = Path(r"C:\Program Files\Blackmagic Design\DaVinci Resolve\fuscript.exe")
 
@@ -81,13 +81,77 @@ def test_a_request_nobody_answered_is_withdrawn(tmp_path):
     link = Link(tmp_path)
     with pytest.raises(RuntimeError):
         MailboxClient(link, timeout=0.2).apply([{"frame": 1, "color": "Green"}])
-    assert link._read("request.json") is None
+    assert link.pending_request() is None
 
 
-@pytest.mark.skipif(not FUSCRIPT.is_file(), reason="DaVinci Resolve is not installed")
-def test_the_lua_script_listens_until_told_to_stop(tmp_path):
-    """Runs the real menu script in Resolve's own Lua, with a fake timeline."""
-    fake = r'''
+def test_request_and_link_files_round_trip(tmp_path):
+    link = Link(tmp_path)
+    message = {"id": "1", "cmd": "apply", "note": "a ]] b ]=] c", "name": "Épisode"}
+    link.write_request(message)
+    text = (tmp_path / "request.lua").read_text(encoding="utf-8")
+    assert text.startswith("return [")
+    assert link.pending_request() == message
+    link.write_status(True, "Episode")
+    link.write_response({"id": "1", "ok": True})
+    assert link.running()
+    assert link.read_response() == {"id": "1", "ok": True}
+    assert parse_link("garbage") == {}
+    assert parse_link('VispaMP = { Status = "7b2' + '" }') == {}
+
+
+def test_the_reader_finds_the_block_in_a_full_fusion_prefs_file():
+    prefs = (
+        '{\n\tGlobal = {\n\t\tPaths = {\n\t\t\tMap = { ["Comps:"] = "x" },\n\t\t},\n'
+        '\t\tScript = {\n\t\t\tVISPA_CAPTURE_UI = {\n\t\t\t\tPayloadHex = "7b7d"\n\t\t\t},\n'
+        '\t\t\tVispaMP = {\n\t\t\t\tStatus = "' + '{"running":true,"at":1}'.encode().hex() + '",\n'
+        '\t\t\t\tOwner = "31302d31"\n\t\t\t}\n\t\t},\n\t},\n}\n'
+    )
+    assert parse_link(prefs)["Status"] == {"running": True, "at": 1}
+
+
+# Fusion's data store, as the script uses it: SetData, GetData, SavePrefs.
+# The saved file mimics what Resolve writes, reduced to the VispaMP block.
+FAKE_FUSION = r'''
+local real_io = io
+local store = {}
+local function render()
+  local parts = { "{\n\tGlobal = {\n\t\tScript = {\n\t\t\tVispaMP = {\n" }
+  for key, value in pairs(store) do
+    parts[#parts + 1] = "\t\t\t\t" .. key .. ' = "' .. tostring(value) .. '",\n'
+  end
+  parts[#parts + 1] = "\t\t\t},\n\t\t},\n\t},\n}\n"
+  return table.concat(parts)
+end
+fake_fusion = {
+  SetData = function(_, key, value)
+    if key == "VispaMP" then store = {} return end
+    store[key:match("^VispaMP%.(.+)$")] = value
+  end,
+  GetData = function(_, key) return store[key:match("^VispaMP%.(.+)$")] end,
+  SavePrefs = function(_, path)
+    local file = real_io.open(path, "wb")
+    file:write(render())
+    file:close()
+  end,
+}
+fusion = fake_fusion
+'''
+
+# What Workspace > Scripts really offers in Resolve 21 free: no io, no ffi,
+# no require, no os.remove. fuscript has everything, so the sandboxed cases
+# strip it. fuscript gives the script its own environment that falls back to
+# _G, so clearing a name means clearing it in both places.
+RESOLVE_SANDBOX = r'''
+os.remove = nil
+os.rename = nil
+for _, name in ipairs({ "io", "ffi", "require", "package" }) do
+  _G[name] = nil
+  getfenv(1)[name] = nil
+end
+assert(io == nil and ffi == nil and require == nil)
+'''
+
+FAKE_TIMELINE = r'''
 local marks = {}
 local timeline = {
   GetName = function() return "Episode" end,
@@ -110,9 +174,30 @@ local project = { GetCurrentTimeline = function() return timeline end }
 local manager = { GetCurrentProject = function() return project end }
 resolve = { GetProjectManager = function() return manager end }
 '''
+
+# Workspace > Scripts hands the script `app` (Fusion) and no `resolve`.
+MENU = r'''
+local handed = resolve
+resolve = nil
+fusion = nil
+app = fake_fusion
+app.GetResolve = function() return handed end
+'''
+
+
+@pytest.mark.skipif(not FUSCRIPT.is_file(), reason="DaVinci Resolve is not installed")
+@pytest.mark.parametrize(
+    "sandbox, menu",
+    [(False, False), (True, False), (True, True)],
+    ids=["plain-lua", "resolve-console", "resolve-menu"],
+)
+def test_the_lua_script_listens_until_told_to_stop(tmp_path, sandbox, menu):
+    """Runs the real menu script in Resolve's own Lua, with fake Fusion and timeline."""
+    harness = FAKE_FUSION + (RESOLVE_SANDBOX if sandbox else "") + FAKE_TIMELINE + (MENU if menu else "")
     script = tmp_path / "harness.lua"
-    script.write_text(fake + launcher_source(root=tmp_path), encoding="utf-8")
+    script.write_text(harness + launcher_source(root=tmp_path), encoding="utf-8")
     link = Link(tmp_path / "cache" / "resolve_link")
+    link.folder.mkdir(parents=True)
     process = subprocess.Popen(
         [str(FUSCRIPT), "-l", "lua", str(script)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -121,6 +206,7 @@ resolve = { GetProjectManager = function() return manager end }
     try:
         client = MailboxClient(link, timeout=15)
         assert client.ping() == {"ok": True}
+        assert link.pending_request() is None
         assert client.read()["timeline_name"] == "Episode"
         placed = client.apply([{"frame": 12, "color": "Green"}], 0, 100)
         assert placed["placed"] == [12]
