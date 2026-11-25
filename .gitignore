@@ -5,3 +5,4 @@ cache/
 models/
 tools/
 *.pyc
+presets/user.json

@@ -151,7 +151,7 @@ def _collapse_frames(frames):
     return [by_frame[key] for key in sorted(by_frame)]
 
 
-def build_shots(clips, strips, timeline_fps):
+def build_shots(clips, strips, timeline_fps, cancel=None):
     """Shots on video 1. A clip edge is a cut; a long clip is also cut inside.
 
     ``strips[i]`` is the RGB filmstrip of ``clips[i]``, one picture per source frame
@@ -167,7 +167,7 @@ def build_shots(clips, strips, timeline_fps):
         source_fps = float(clip.get("fps") or timeline_fps)
         frame_us = max(1, int(round(1_000_000 / source_fps)))
         timed = [(index * frame_us, pictures[index]) for index in range(len(pictures))]
-        records = {record["index"]: record for record in cut_records(timed)}
+        records = {record["index"]: record for record in cut_records(timed, cancel)}
         boundaries = [0] + sorted(records) + [len(pictures)]
         for start_index, end_index in zip(boundaries, boundaries[1:]):
             if end_index <= start_index:

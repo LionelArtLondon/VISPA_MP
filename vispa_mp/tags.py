@@ -14,6 +14,22 @@ EXPRESSION_TAGS = ("smile", "grin", "serious", "angry", "annoyed", "surprised",
 # that inside are better. A tooth line with no cavity is a different pose.
 INTERIOR_TAGS = ("open_mouth", "tongue", "uvula")
 TEETH_ONLY_TAGS = ("upper_teeth_only", "lower_teeth_only", "clenched_teeth")
+# Raise this when features_from_probs changes: saved scores are then read again.
+SCORE_VERSION = 1
+
+
+def model_id(model_path):
+    """Names the saved scores of one model file and one version of the features."""
+    import hashlib
+    from pathlib import Path
+    path = Path(model_path)
+    try:
+        stat = path.stat()
+        stamp = f"{stat.st_size}-{stat.st_mtime_ns}"
+    except OSError:
+        stamp = "missing"
+    raw = f"{path.name}|{stamp}|{SCORE_VERSION}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def providers():

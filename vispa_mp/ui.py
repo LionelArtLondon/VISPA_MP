@@ -5,6 +5,7 @@ inside this window: dragging the Video 1 ruler does not move Resolve.
 """
 
 import os
+import threading
 from functools import partial
 from pathlib import Path
 
@@ -17,11 +18,11 @@ from PySide6.QtWidgets import (
     QWidget, QMainWindow, QMessageBox,
 )
 
-from vispa_mp.analyze import analyze, refresh_utterances
+from vispa_mp.analyze import analyze, refresh_utterances, saved_analysis
 from vispa_mp.client import open_client
 from vispa_mp.resolve_link import free_script_installed, link_running
 from vispa_mp.markers import NAMES, PAGE
-from vispa_mp.preset import DEFAULTS, load
+from vispa_mp.preset import load, load_user, save_user
 from vispa_mp.rules import _cavity, page_goal, propose, target_pages
 from vispa_mp.timebase import format_timecode
 from vispa_mp.ui_tokens import (
@@ -484,16 +485,24 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         self.playhead_frame = None
         self.last_seek = None
         self.worker = None
+        self._stop_analysis = None
         self.mode = "strip"
-        self.page_format = "A5"
-        self.orientation = "portrait"
-        self.custom_width = 148
-        self.custom_height = 210
+        self._stored_settings, view = load_user()
+        names = [name for name, _width, _height in FORMATS]
+        self.page_format = view["page_format"] if view["page_format"] in names else "A5"
+        self.orientation = view["orientation"] if view["orientation"] in ("portrait", "landscape") else "portrait"
+        self.custom_width = min(2000, max(10, int(view["custom_width"])))
+        self.custom_height = min(2000, max(10, int(view["custom_height"])))
         self._ready = False
         self.widgets = {}
         self._rows = {}
         self._build()
         self._ready = True
+        # Sliders fire on every step: the file is written once they settle.
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(400)
+        self._save_timer.timeout.connect(self.save_settings)
         self._resolve_timer = QTimer(self)
         self._resolve_timer.setInterval(1000)
         self._resolve_timer.timeout.connect(self._sync_resolve)
@@ -702,7 +711,7 @@ class MainWindow(WindowChromeMixin, QMainWindow):
             self.format_group.addButton(button)
             self.format_buttons[name] = button
             row.addWidget(button)
-        self.format_buttons["A5"].setChecked(True)
+        self.format_buttons[self.page_format].setChecked(True)
         row.addSpacing(8)
         row.addWidget(self._muted("Orientation"))
         self.orientation_group = QButtonGroup(self)
@@ -717,7 +726,7 @@ class MainWindow(WindowChromeMixin, QMainWindow):
             self.orientation_group.addButton(button)
             self.orientation_buttons[name] = button
             row.addWidget(button)
-        self.orientation_buttons["portrait"].setChecked(True)
+        self.orientation_buttons[self.orientation].setChecked(True)
         row.addSpacing(8)
         row.addWidget(self._muted("Width"))
         self.width_box = QSpinBox()
@@ -744,7 +753,7 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         title = QLabel("Adjust")
         title.setProperty("role", "panelTitle")
         column.addWidget(title)
-        values = load()
+        values = self._stored_settings
         form = QWidget()
         form_layout = QVBoxLayout(form)
         form_layout.setContentsMargins(12, 0, 12, 0)
@@ -843,7 +852,7 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         host = QWidget()
         form = QFormLayout(host)
-        values = load()
+        values = self._stored_settings
         story = QWidget()
         story_layout = QVBoxLayout(story)
         story_layout.setContentsMargins(0, 0, 0, 0)
@@ -911,7 +920,24 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         label.setProperty("role", "muted")
         return label
 
+    def _schedule_save(self):
+        if self._ready and hasattr(self, "_save_timer"):
+            self._save_timer.start()
+
+    def save_settings(self):
+        """Only what differs from presets/default.json goes to presets/user.json."""
+        self._save_timer.stop()
+        view = {
+            "page_format": self.page_format, "orientation": self.orientation,
+            "custom_width": int(self.custom_width), "custom_height": int(self.custom_height),
+        }
+        try:
+            save_user(self.settings(), view)
+        except OSError as error:
+            self.status.setText(f"Settings were not saved: {error}")
+
     def _changed(self, *_args):
+        self._schedule_save()
         if getattr(self, "page_target", None) is not None:
             self._refresh_target()
         self._show_slider_value("sharpness_floor", getattr(self, "sharpness_value", None))
@@ -925,7 +951,7 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         label.setText(f"{self.widgets[key].value() / SLIDER_SCALE[key]:.2f}")
 
     def settings(self):
-        data = dict(DEFAULTS)
+        data = dict(self._stored_settings)
         for key, widget in self.widgets.items():
             if isinstance(widget, QCheckBox):
                 data[key] = widget.isChecked()
@@ -949,11 +975,15 @@ class MainWindow(WindowChromeMixin, QMainWindow):
             widget.setValue(value)
 
     def reset_settings(self):
+        """Back to presets/default.json. The page format is a view choice and stays."""
         self._ready = False
-        for key, value in DEFAULTS.items():
+        shipped = load()
+        self._stored_settings = dict(shipped)
+        for key, value in shipped.items():
             if key in self.widgets:
                 self.set_setting(key, value)
         self._ready = True
+        self.save_settings()
         self._refresh_target()
         self.recompute()
 
@@ -1400,6 +1430,7 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         self.page_format = name
         self._sync_size_fields()
         self._refresh_board()
+        self._schedule_save()
 
     def _choose_orientation(self, name):
         if name == self.orientation:
@@ -1409,6 +1440,7 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         self.orientation = name
         self._sync_size_fields()
         self._refresh_board()
+        self._schedule_save()
 
     def _custom_size_edited(self):
         if self.page_format != "Custom":
@@ -1416,6 +1448,7 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         self.custom_width = int(self.width_box.value())
         self.custom_height = int(self.height_box.value())
         self._refresh_board()
+        self._schedule_save()
 
     def _set_mode(self, mode):
         if mode == self.mode:
@@ -1556,20 +1589,34 @@ class MainWindow(WindowChromeMixin, QMainWindow):
 
     def _worker_finished(self):
         self.worker = None
+        if self._stop_analysis is not None:
+            self._stop_analysis = None
+            self.analyze_button.setText("Analyze")
 
     def _failed(self, message):
         self.status.setText(message)
         QMessageBox.warning(self, "VISPA MP", message)
 
+    def _cache_dir(self):
+        return Path(__file__).resolve().parents[1] / "cache"
+
     def read_timeline(self):
         self.status.setText(self._resolve_wait_text("Reading the timeline…"))
+        settings = self.settings()
+        cache = self._cache_dir()
 
         def work(_progress):
             client = self.client or open_client()
-            return client, client.read()
+            snapshot = client.read()
+            saved = None
+            try:
+                saved = saved_analysis(snapshot, settings, cache)
+            except Exception:
+                saved = None  # a damaged save only means analyzing again
+            return client, snapshot, saved
 
         def done(payload):
-            self.client, self.snapshot = payload
+            self.client, self.snapshot, saved = payload
             self._sync_resolve()
             self._sync_header()
             name = self.snapshot.get("timeline_name") or "timeline"
@@ -1579,26 +1626,54 @@ class MainWindow(WindowChromeMixin, QMainWindow):
                 f"{len(self.snapshot.get('markers') or [])} marker(s)"
             )
             self._show_warnings()
+            current = (self.analysis or {}).get("key")
+            if saved and saved.get("key") != current:
+                self.show_analysis(saved)
+                self.status.setText(
+                    f"Previous analysis restored: {len(self.proposals)} markers proposed. "
+                    "Analyze again only if the edit changed.")
 
         self._start(work, done)
 
     def run_analysis(self):
+        if self._stop_analysis is not None:
+            self._stop_analysis.set()
+            self.status.setText("Stopping…")
+            return
+        if self.worker is not None:
+            return
         if self.snapshot is None:
             self.status.setText("Read the timeline first.")
             return
         self.status.setText("Analyzing…")
         settings = self.settings()
         snapshot = dict(self.snapshot)
-        snapshot["cache"] = str(Path(__file__).resolve().parents[1] / "cache")
+        cache = self._cache_dir()
+        snapshot["cache"] = str(cache)
+        stop = threading.Event()
 
         def work(progress):
-            return analyze(snapshot, settings, progress=progress)
+            try:
+                return analyze(snapshot, settings, progress=progress, cancel=stop.is_set, store=cache)
+            except InterruptedError:
+                return None
 
         def done(analysis):
+            if analysis is None:
+                self.status.setText(
+                    "Analysis stopped. The images already recognized are kept: Analyze resumes from there.")
+                return
             self.show_analysis(analysis)
-            self.status.setText(f"{len(self.proposals)} markers proposed. A threshold recalculates without running the models.")
+            if analysis.get("restored"):
+                self.status.setText(f"Analysis loaded from the cache: {len(self.proposals)} markers proposed.")
+            else:
+                self.status.setText(
+                    f"{len(self.proposals)} markers proposed. A threshold recalculates without running the models.")
 
         self._start(work, done)
+        if self.worker is not None:
+            self._stop_analysis = stop
+            self.analyze_button.setText("Cancel")
 
     def write_markers(self):
         if not self.proposals:
@@ -1647,6 +1722,8 @@ class MainWindow(WindowChromeMixin, QMainWindow):
         self._start(work, done)
 
     def closeEvent(self, event):
+        if self._save_timer.isActive():
+            self.save_settings()
         if self.client is not None:
             self.client.close()
         super().closeEvent(event)

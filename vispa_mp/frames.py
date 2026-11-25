@@ -4,6 +4,8 @@ import hashlib
 import os
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +13,8 @@ import numpy as np
 from vispa_mp.shots import HEIGHT, WIDTH
 
 ROOT = Path(__file__).resolve().parents[1]
+STILL_WIDTH = 448
+STOPPED = "The analysis was stopped."
 
 
 def ffmpeg_path():
@@ -44,23 +48,95 @@ def _rate_args(binary):
     cached = getattr(_rate_args, "value", None)
     if cached and cached[0] == binary:
         return cached[1]
-    probe = subprocess.run([binary, "-hide_banner", "-h", "full"], capture_output=True, text=True)
+    probe = subprocess.run([binary, "-hide_banner", "-h", "full"], capture_output=True, text=True,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     text = (probe.stdout or "") + (probe.stderr or "")
     args = ["-fps_mode", "vfr"] if "-fps_mode" in text else ["-vsync", "vfr"]
     _rate_args.value = (binary, args)
     return args
 
 
-def _run(command):
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    output, error = process.communicate()
-    if process.returncode != 0:
-        message = error.decode("utf-8", "replace")[-800:]
-        raise RuntimeError(message or f"ffmpeg failed ({process.returncode}).")
+class _Ffmpeg:
+    """One ffmpeg process read from stdout. ``cancel`` kills it, even mid-decode."""
+
+    def __init__(self, command, cancel=None):
+        self.cancel = cancel
+        self.cancelled = False
+        self.finished_early = False
+        self.process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        self.stdout = self.process.stdout
+        self._errors = []
+        self._drain = threading.Thread(target=self._read_errors, daemon=True)
+        self._drain.start()
+        if cancel is not None:
+            threading.Thread(target=self._watch, daemon=True).start()
+
+    def _read_errors(self):
+        self._errors.append(self.process.stderr.read())
+
+    def _watch(self):
+        while self.process.poll() is None:
+            if self.cancel():
+                self.cancelled = True
+                self.process.kill()
+                return
+            time.sleep(0.1)
+
+    def stop(self):
+        """Enough was read: end ffmpeg without calling it a failure."""
+        self.finished_early = True
+        if self.process.poll() is None:
+            self.process.kill()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, _value, _trace):
+        if kind is not None and self.process.poll() is None:
+            self.process.kill()
+        code = self.process.wait()
+        self._drain.join(timeout=5)
+        if self.cancelled or (self.cancel is not None and self.cancel()):
+            raise InterruptedError(STOPPED)
+        if kind is None and code != 0 and not self.finished_early:
+            message = b"".join(item or b"" for item in self._errors).decode("utf-8", "replace")[-800:]
+            raise RuntimeError(message or f"ffmpeg failed ({code}).")
+        return False
+
+
+def _run(command, cancel=None):
+    with _Ffmpeg(command, cancel) as run:
+        output = run.stdout.read()
     return output
 
 
-def load_filmstrip(clip, cache, binary=None):
+def _read_exactly(stream, size):
+    data = stream.read(size)
+    if data is None or len(data) < size:
+        return None
+    return data
+
+
+def ppm_frames(stream):
+    """Pictures from ffmpeg's ``-f image2pipe -c:v ppm`` output, one array each."""
+    while True:
+        magic = stream.readline()
+        if not magic:
+            return
+        if magic.strip() != b"P6":
+            raise RuntimeError("ffmpeg sent an unexpected picture format.")
+        size = stream.readline().split()
+        stream.readline()
+        width, height = int(size[0]), int(size[1])
+        data = _read_exactly(stream, width * height * 3)
+        if data is None:
+            return
+        yield np.frombuffer(data, dtype=np.uint8).reshape(height, width, 3)
+
+
+def load_filmstrip(clip, cache, binary=None, cancel=None):
     """64×36 RGB pictures for every source frame of the clip, cached."""
     binary = binary or ffmpeg_path()
     start = int(clip.get("source_start") or 0)
@@ -76,7 +152,7 @@ def load_filmstrip(clip, cache, binary=None):
     command = [binary, "-hide_banner", "-loglevel", "error", "-i", clip["path"],
                "-vf", f"select='between(n,{start},{end})',scale={WIDTH}:{HEIGHT}:flags=bilinear",
                *_rate_args(binary), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
-    raw = _run(command)
+    raw = _run(command, cancel)
     frame_bytes = WIDTH * HEIGHT * 3
     got = len(raw) // frame_bytes
     if got <= 0:
@@ -86,7 +162,7 @@ def load_filmstrip(clip, cache, binary=None):
     return frames
 
 
-def load_waveform(clip, timeline_fps, cache, binary=None):
+def load_waveform(clip, timeline_fps, cache, binary=None, cancel=None):
     """Mono float32 at 16 kHz, starting at the clip's first timeline frame."""
     binary = binary or ffmpeg_path()
     source_fps = float(clip.get("fps") or timeline_fps)
@@ -100,43 +176,61 @@ def load_waveform(clip, timeline_fps, cache, binary=None):
     command = [binary, "-hide_banner", "-loglevel", "error", "-i", clip["path"],
                "-ss", f"{start_sec:.6f}", "-t", f"{duration:.6f}",
                "-ac", "1", "-ar", "16000", "-f", "f32le", "pipe:1"]
-    raw = _run(command)
+    raw = _run(command, cancel)
     audio = np.frombuffer(raw, dtype=np.float32).copy() if raw else np.zeros(0, dtype=np.float32)
     np.save(stored, audio)
     return audio
 
 
-def extract_stills(frames, cache, binary=None):
-    """One JPEG per candidate, grouped so each media file is decoded once."""
+def _save_still(picture, destination):
+    from PIL import Image
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_name(destination.stem + ".part.jpg")
+    Image.fromarray(picture).save(partial, quality=92)
+    os.replace(partial, destination)
+
+
+def extract_stills(frames, cache, binary=None, cancel=None, progress=None):
+    """One JPEG per candidate, 448 px wide.
+
+    Each media file is decoded once, from the first wanted frame to the last.
+    ffmpeg sends every picture of that span and Python keeps the wanted ones,
+    so there is no limit on how many stills one pass can write.
+    """
     binary = binary or ffmpeg_path()
+    progress = progress or (lambda _text: None)
     cache = Path(cache) / "stills"
     cache.mkdir(parents=True, exist_ok=True)
     groups = {}
     for frame in frames:
         groups.setdefault(frame["media"], []).append(frame)
     for media, items in groups.items():
-        pending = []
+        pending = {}
         for frame in items:
-            dest = cache / _key(media, int(frame["source_frame"]), 1)
-            dest = dest.with_suffix(".jpg")
+            number = int(frame["source_frame"])
+            dest = cache / (_key(media, number, 1) + ".jpg")
             frame["image"] = str(dest)
             if not dest.is_file():
-                pending.append(frame)
+                pending.setdefault(number, dest)
         if not pending:
             continue
-        pending.sort(key=lambda frame: int(frame["source_frame"]))
-        select = "+".join(f"eq(n,{int(frame['source_frame'])})" for frame in pending)
-        folder = cache / "batch"
-        folder.mkdir(parents=True, exist_ok=True)
-        pattern = str(folder / "frame_%05d.jpg")
-        for old in folder.glob("frame_*.jpg"):
-            old.unlink()
+        first, last = min(pending), max(pending)
         command = [binary, "-hide_banner", "-loglevel", "error", "-i", media,
-                   "-vf", f"select='{select}',scale=448:-2", *_rate_args(binary), "-q:v", "3", pattern]
-        _run(command)
-        written = sorted(folder.glob("frame_*.jpg"))
-        if len(written) != len(pending):
-            raise RuntimeError(f"{len(written)} images extracted for {len(pending)} requested in {media}.")
-        for src, frame in zip(written, pending):
-            Path(frame["image"]).parent.mkdir(parents=True, exist_ok=True)
-            src.replace(frame["image"])
+                   "-vf", f"select='between(n,{first},{last})',scale={STILL_WIDTH}:-2",
+                   *_rate_args(binary), "-f", "image2pipe", "-c:v", "ppm", "pipe:1"]
+        written = 0
+        name = Path(media).name
+        with _Ffmpeg(command, cancel) as run:
+            for offset, picture in enumerate(ppm_frames(run.stdout)):
+                number = first + offset
+                dest = pending.get(number)
+                if dest is not None:
+                    _save_still(picture, dest)
+                    written += 1
+                    if written == 1 or written % 25 == 0:
+                        progress(f"Images from {name}: {written}/{len(pending)}")
+                if number >= last:
+                    run.stop()
+                    break
+        if written != len(pending):
+            raise RuntimeError(f"{written} images extracted for {len(pending)} requested in {media}.")
