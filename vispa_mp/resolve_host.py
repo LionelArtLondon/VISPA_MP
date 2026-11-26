@@ -41,10 +41,10 @@ def handle_once(resolve, link):
         if command == "stop":
             result = {"ok": True, "stopping": True}
         else:
-            timeline = None
+            timeline = project = None
             if command != "ping":
-                timeline = _timeline(resolve)
-            result = dispatch(request, timeline)
+                timeline, project = _target(resolve)
+            result = dispatch(request, timeline, project)
         link.write_response({"id": request.get("id"), "ok": True, "result": result})
     except Exception as error:
         link.write_response({"id": request.get("id"), "ok": False, "error": str(error)})
@@ -68,7 +68,7 @@ def replaced_by_newer(status, owner, started):
     return other > owner
 
 
-def _timeline(resolve):
+def _target(resolve):
     if resolve is None:
         raise RuntimeError("This script must be started from Workspace > Scripts inside Resolve.")
     manager = resolve.GetProjectManager()
@@ -78,7 +78,11 @@ def _timeline(resolve):
     timeline = project.GetCurrentTimeline()
     if timeline is None:
         raise RuntimeError("No timeline is open.")
-    return timeline
+    return timeline, project
+
+
+def _timeline(resolve):
+    return _target(resolve)[0]
 
 
 def _timeline_name(resolve):

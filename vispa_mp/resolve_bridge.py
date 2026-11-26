@@ -8,12 +8,13 @@ import json
 import os
 import sys
 
-from vispa_mp.markers import AUTOMATIC, cue_warning, is_automatic, plan_apply
+from vispa_mp.markers import AUTOMATIC, NAMES, cue_warning, is_automatic, plan_apply
 from vispa_mp.timebase import absolute_mark, parse_fps
+from vispa_mp.timeline_identity import normalize_identity, read_identity
 
 VIDEO_TRACK = 1
 # Same number as SCRIPT_VERSION in resolve_scripts/VISPA_MP.lua.
-SCRIPT_VERSION = 2
+SCRIPT_VERSION = 5
 AUDIO_TRACK = 1
 
 
@@ -152,7 +153,7 @@ def _track_names(timeline, track_type):
     return names
 
 
-def read_timeline(timeline):
+def read_timeline(timeline, project=None):
     """A JSON-ready snapshot of video 1, audio 1, markers and the in/out range."""
     if timeline is None:
         raise RuntimeError("No timeline is open.")
@@ -180,8 +181,14 @@ def read_timeline(timeline):
         warnings.append("Video 1 has no clip linked to a file.")
     if not audio:
         warnings.append("Audio 1 has no clip linked to a file. Lines will not be detected.")
+    try:
+        project_name = project.GetName() if project is not None else ""
+    except Exception:
+        project_name = ""
     snapshot = {
+        "project_name": project_name if isinstance(project_name, str) else "",
         "timeline_name": timeline.GetName() or "",
+        "timeline_identity": read_identity(timeline, project),
         "interlaced": interlace_raw in ("1", "true"),
         "script_version": SCRIPT_VERSION,
         "start_frame": start_frame,
@@ -202,36 +209,83 @@ def read_timeline(timeline):
     return snapshot
 
 
-def apply_markers(timeline, proposals, start=None, end=None):
+def apply_markers(timeline, proposals, start=None, end=None, expected_timeline=None, project=None):
     """Replace vispa-mp markers in the range. Markers placed by hand stay."""
+    expected = normalize_identity(expected_timeline)
+    if expected is None:
+        raise RuntimeError("The analysis has no verified timeline identity. Read the timeline and analyze again.")
+    actual = read_identity(timeline, project)
+    if actual is None:
+        raise RuntimeError("Resolve could not verify the current timeline identity. No markers were changed.")
+    if actual != expected:
+        raise RuntimeError("The active timeline is not the analyzed timeline. Return to the analyzed timeline; no markers were changed.")
+    proposals = list(proposals or [])
+    outside = [int(proposal["frame"]) for proposal in proposals
+               if start is not None and end is not None and not start <= int(proposal["frame"]) < end]
+    eligible = [proposal for proposal in proposals
+                if start is None or end is None or start <= int(proposal["frame"]) < end]
+    # Validate names before deleting anything. Resolve refuses empty names, even
+    # though Cue only needs the colour to interpret a marker.
+    for proposal in eligible:
+        if proposal.get("color") not in NAMES:
+            raise RuntimeError("An unsupported marker color was requested. No markers were changed.")
+    if not eligible:
+        return {"deleted": [], "placed": [], "skipped": [], "failed": [], "outside": outside,
+                "verified": True, "requested": len(proposals), "attempted": 0}
     existing = _markers(timeline)
-    delete, add, skipped = plan_apply(existing, proposals, start, end)
+    delete, add, skipped = plan_apply(existing, eligible, start, end)
+    add = sorted(add, key=lambda proposal: int(proposal["frame"]))
+    # Replacing the same range reuses its numbers. Names on retained markers
+    # (manual, or outside the range) stay reserved so new names remain unique.
+    deleted_frames = set(delete)
+    reserved = {marker["name"].lower() for marker in existing if marker["frame"] not in deleted_frames}
+    names = {}
+    number = 1
+    for proposal in add:
+        while f"marqueur-{number:03d}" in reserved:
+            number += 1
+        name = f"marqueur-{number:03d}"
+        names[int(proposal["frame"])] = name
+        reserved.add(name)
+        number += 1
     for frame in delete:
         timeline.DeleteMarkerAtFrame(int(frame))
-    placed = []
     for proposal in add:
         frame = int(proposal["frame"])
-        # Colour is the whole marker. Name and note stay empty: the exporter
-        # already builds the filename data from the colour alone.
-        ok = timeline.AddMarker(frame, proposal["color"], "", "", 1, AUTOMATIC)
-        if ok:
+        timeline.AddMarker(frame, proposal["color"], names[frame], "", 1, AUTOMATIC)
+    # A call's return value alone is not proof that a marker exists. Count only
+    # the expected marker data read back from this same verified timeline.
+    try:
+        recorded = {marker["frame"]: marker for marker in _markers(timeline)}
+    except Exception as error:
+        raise RuntimeError("Resolve did not return its markers after writing. The placement could not be verified.") from error
+    placed, failed = [], []
+    for proposal in add:
+        frame = int(proposal["frame"])
+        marker = recorded.get(frame)
+        if (marker is not None and marker["color"] == proposal["color"]
+                and marker["name"] == names[frame] and marker["custom_data"] == AUTOMATIC):
             placed.append(frame)
         else:
-            skipped.append(frame)
-    return {"deleted": delete, "placed": placed, "skipped": skipped}
+            failed.append(frame)
+    return {"deleted": delete, "placed": placed, "skipped": skipped + failed, "failed": failed,
+            "outside": outside, "verified": True, "requested": len(proposals), "attempted": len(add)}
 
 
-def dispatch(command, timeline):
+def dispatch(command, timeline, project=None):
     name = command.get("cmd")
     if name == "ping":
         return {"ok": True}
     if name == "read":
-        return read_timeline(timeline)
+        return read_timeline(timeline, project)
     if name == "seek":
         ok = timeline.SetCurrentTimecode(command["timecode"])
         return {"ok": bool(ok), "timecode": command["timecode"]}
     if name == "apply":
-        return apply_markers(timeline, command.get("proposals") or [], command.get("start"), command.get("end"))
+        raise RuntimeError("Unchecked marker placement is no longer supported. Restart VISPA MP and its Resolve script.")
+    if name == "apply_checked":
+        return apply_markers(timeline, command.get("proposals") or [], command.get("start"), command.get("end"),
+                             expected_timeline=command.get("expected_timeline"), project=project)
     raise RuntimeError(f"Unknown command: {name}")
 
 
@@ -242,13 +296,13 @@ def serve(resolve):
             continue
         message = json.loads(line)
         try:
-            timeline = None
+            timeline = project = None
             if message.get("cmd") != "ping":
                 project = resolve.GetProjectManager().GetCurrentProject()
                 if not project:
                     raise RuntimeError("No project is open.")
                 timeline = project.GetCurrentTimeline()
-            result = dispatch(message, timeline)
+            result = dispatch(message, timeline, project)
             payload = {"id": message.get("id"), "ok": True, "result": result}
         except Exception as error:
             payload = {"id": message.get("id"), "ok": False, "error": str(error)}

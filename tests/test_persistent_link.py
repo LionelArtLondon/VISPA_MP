@@ -153,9 +153,15 @@ assert(io == nil and ffi == nil and require == nil)
 '''
 
 FAKE_TIMELINE = r'''
-local marks = {}
-local timeline = {
-  GetName = function() return "Episode" end,
+local timeline
+local original
+local project_id = "project-a"
+local function new_timeline(id, marks)
+  local value = {
+  id = id,
+  name = "Episode",
+  GetUniqueId = function(self) return self.id end,
+  GetName = function(self) return self.name end,
   GetStartFrame = function() return 0 end,
   GetEndFrame = function() return 100 end,
   GetStartTimecode = function() return "00:00:00:00" end,
@@ -165,13 +171,43 @@ local timeline = {
   GetItemListInTrack = function() return {} end,
   GetMarkInOut = function() return {} end,
   GetMarkers = function() return marks end,
-  AddMarker = function(_, frame, color, name, note, duration, custom)
+  AddMarker = function(self, frame, color, name, note, duration, custom)
+    if not name or name == "" or frame < 0 or frame >= 100 then return false end
+    if self.phantom then return true end
     marks[frame] = { color = color, name = name, note = note, duration = duration, customData = custom }
     return true
   end,
   DeleteMarkerAtFrame = function(_, frame) marks[frame] = nil return true end,
+  SetCurrentTimecode = function(self, control)
+    if control == "timeline-b" then
+      timeline = new_timeline("timeline-b", {
+        [25] = { color = "Blue", customData = "vispa-mp" },
+        [30] = { color = "Cyan", customData = "" },
+      })
+    elseif control == "timeline-a" then timeline = original
+    elseif control == "project-b" then project_id = "project-b"
+    elseif control == "project-a" then project_id = "project-a"
+    elseif control == "rename" then self.name = "Renamed episode"
+    elseif control == "missing-timeline-id" then self.id = nil
+    elseif control == "restore-timeline-id" then self.id = "timeline-a"
+    elseif control == "missing-project-id" then project_id = nil
+    elseif control == "phantom-success" then self.phantom = true
+    elseif control == "restore-writes" then self.phantom = false
+    elseif control == "reserve-manual-name" then
+      marks[5] = { color = "Blue", name = "Marqueur-001", note = "manual", duration = 1, customData = "" }
+    end
+    return true
+  end,
 }
-local project = { GetCurrentTimeline = function() return timeline end }
+  return value
+end
+timeline = new_timeline("timeline-a", {})
+original = timeline
+local project = {
+  GetUniqueId = function() return project_id end,
+  GetName = function() return "Comic project" end,
+  GetCurrentTimeline = function() return timeline end,
+}
 local manager = { GetCurrentProject = function() return project end }
 resolve = { GetProjectManager = function() return manager end }
 '''
@@ -210,10 +246,80 @@ def test_the_lua_script_listens_until_told_to_stop(tmp_path, sandbox, menu):
         assert link.pending_request() is None
         first = client.read()
         assert first["timeline_name"] == "Episode"
-        assert first["script_version"] == 2 and first["interlaced"] is False
-        placed = client.apply([{"frame": 12, "color": "Green"}], 0, 100)
+        assert first["project_name"] == "Comic project"
+        assert first["script_version"] == 5 and first["interlaced"] is False
+        identity = {"project_id": "project-a", "timeline_id": "timeline-a"}
+        assert first["timeline_identity"] == identity
+        proposals = [{"frame": 12, "color": "Green"}]
+        client.seek("phantom-success")
+        phantom = client.apply(proposals, 0, 100, expected_timeline=identity)
+        assert phantom["verified"] is True
+        assert phantom["placed"] == [] and phantom["failed"] == [12]
+        assert client.read()["markers"] == []
+        client.seek("restore-writes")
+        placed = client.apply(proposals, 0, 100, expected_timeline=identity)
         assert placed["placed"] == [12]
-        assert [m["frame"] for m in client.read()["markers"]] == [12]
+        assert placed["verified"] is True and placed["failed"] == []
+        markers = client.read()["markers"]
+        assert [m["frame"] for m in markers] == [12]
+        assert markers[0]["name"] == "marqueur-001" and markers[0]["custom_data"] == "vispa-mp"
+        outside = client.apply([{"frame": 20, "color": "Blue"}], 0, 10, expected_timeline=identity)
+        assert outside["outside"] == [20] and outside["placed"] == outside["deleted"] == []
+        assert client.read()["markers"] == markers
+        with pytest.raises(RuntimeError, match="Unchecked marker placement"):
+            client.request("apply", proposals=proposals, expected_timeline=identity)
+        for invalid in (None, {}, "timeline-a", {"project_id": "project-a", "timeline_id": " "},
+                        {"project_id": "project-a", "timeline_id": 12}):
+            with pytest.raises(RuntimeError, match="no verified timeline identity"):
+                client.request("apply_checked", proposals=proposals, expected_timeline=invalid)
+        assert client.read()["markers"] == markers
+
+        # Same displayed name, different timeline: neither its automatic nor its
+        # hand-placed markers may be touched by the original analysis.
+        client.seek("timeline-b")
+        other = client.read()
+        assert other["timeline_name"] == first["timeline_name"]
+        assert [m["frame"] for m in other["markers"]] == [25, 30]
+        with pytest.raises(RuntimeError, match="not the analyzed timeline"):
+            client.apply(proposals, expected_timeline=identity)
+        assert client.read()["markers"] == other["markers"]
+        client.seek("timeline-a")
+
+        # Reusing a timeline id in another project is also rejected.
+        client.seek("project-b")
+        with pytest.raises(RuntimeError, match="not the analyzed timeline"):
+            client.apply(proposals, expected_timeline=identity)
+        assert client.read()["markers"] == markers
+        client.seek("project-a")
+
+        # A renamed timeline keeps its stable identity and remains writable.
+        client.seek("rename")
+        assert client.read()["timeline_name"] == "Renamed episode"
+        assert client.apply(proposals, expected_timeline=identity)["placed"] == [12]
+        for missing in ("missing-timeline-id", "missing-project-id"):
+            client.seek(missing)
+            with pytest.raises(RuntimeError, match="could not identify"):
+                client.apply(proposals, expected_timeline=identity)
+            assert client.read()["markers"] == markers
+            client.seek("restore-timeline-id" if missing == "missing-timeline-id" else "project-a")
+        # Number all roles together in time order, preserve reserved names, and
+        # keep numbering stable when the same range is applied again.
+        unsorted = [{"frame": 70, "color": "Cyan"}, {"frame": 12, "color": "Green"},
+                    {"frame": 40, "color": "Blue"}, {"frame": 95, "color": "Cyan"}]
+        numbered = client.apply(unsorted, 0, 90, expected_timeline=identity)
+        assert numbered["placed"] == [12, 40, 70] and numbered["outside"] == [95]
+        numbers = client.read()["markers"]
+        assert [m["name"] for m in numbers] == ["marqueur-001", "marqueur-002", "marqueur-003"]
+        client.apply(unsorted, 0, 90, expected_timeline=identity)
+        assert client.read()["markers"] == numbers
+        client.seek("reserve-manual-name")
+        client.apply(unsorted, 10, 90, expected_timeline=identity)
+        reserved = client.read()["markers"]
+        assert [m["name"] for m in reserved] == ["Marqueur-001", "marqueur-002", "marqueur-003", "marqueur-004"]
+        assert reserved[0]["note"] == "manual" and reserved[0]["automatic"] is False
+        client.apply([{"frame": 70, "color": "Cyan"}, {"frame": 40, "color": "Blue"}],
+                     40, 90, expected_timeline=identity)
+        assert client.read()["markers"] == reserved
         assert link.running()
         assert client.stop()["stopping"] is True
         output, _ = process.communicate(timeout=15)

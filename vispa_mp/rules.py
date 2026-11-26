@@ -1,5 +1,6 @@
 """Rules that turn measured frames into green, blue and cyan markers."""
 
+from math import ceil, floor, isfinite, sqrt
 from statistics import median
 
 from vispa_mp.markers import CORE, EXTRA, NAMES, PAGE
@@ -68,6 +69,46 @@ def _alike(left, right, limit):
     if not first or len(first) != len(second):
         return False
     return sum(abs(a - b) for a, b in zip(first, second)) / len(first) < limit
+
+
+def drawing_change(left, right):
+    """Contrast-normalised change in the cached 8×8 drawing signatures.
+
+    Brightness alone is not action. The 8 grey-level stabiliser is the same as
+    shot detection uses: near-black noise must not become a large shape change.
+    """
+    first, second = left.get("signature") or [], right.get("signature") or []
+    if not first or len(first) != len(second):
+        return 0.0
+
+    def shape(values):
+        mean = sum(values) / len(values)
+        scale = sqrt(sum((value - mean) ** 2 for value in values) / len(values)) + 8.0
+        return [(value - mean) / scale for value in values]
+
+    return sum(abs(a - b) for a, b in zip(shape(first), shape(second))) / len(first)
+
+
+def action_shot(shot, frames, settings):
+    """A short moving shot, including drawings held for several source frames.
+
+    ``neighbor`` deliberately takes the quieter neighbour to recognise holds;
+    averaging that number misses A,A,B,B,C,C animation. Adjacent cached drawing
+    changes provide an independent signal, without rerunning the image model.
+    """
+    duration = (shot["end"] - shot["start"]) / float(settings.get("_fps") or 24)
+    if duration > float(setting(settings, "action_max_seconds")):
+        return False
+    if float(shot.get("motion") or 0) >= float(setting(settings, "action_motion")):
+        return True
+    ordered = sorted(frames, key=lambda frame: frame["frame"])
+    changes = sorted(drawing_change(left, right) for left, right in zip(ordered, ordered[1:]))
+    if not changes:
+        return False
+    # The upper tenth retains transitions between held poses, rather than
+    # diluting them with all the repeated pictures of limited animation.
+    activity = changes[max(0, ceil(0.9 * len(changes)) - 1)]
+    return activity >= float(setting(settings, "action_structure"))
 
 
 def _blocked(frame, taken, manual, minimum):
@@ -178,26 +219,28 @@ def _pick_speech(frames, utterance, settings, best):
     return max(eligible, key=lambda frame: (_number(frame, "sharpness"), -abs(frame["frame"] - middle))), "speech_unverified"
 
 
-def _spread(frames, shot, count, taken, settings, cores, best):
+def _spread(frames, shot, count, taken, settings, cores, best, manual=()):
     if count <= 0:
         return []
     usable = [frame for frame in frames if quality_ok(frame, settings, best)]
-    holds = [frame for frame in usable if frame.get("hold")] or usable
     points = [shot["start"] + (index + 1) * (shot["end"] - shot["start"]) / (count + 1) for index in range(count)]
     chosen, used = [], set(taken)
     limit = float(setting(settings, "duplicate_diff"))
-    minimum = gap_frames(settings, "min_marker_seconds")
+    minimum = gap_frames(settings, "min_extra_seconds")
+    manual = {int(frame) for frame in manual}
+    structure = float(setting(settings, "action_structure"))
     for point in points:
         pool = []
-        for frame in holds:
-            if frame["frame"] in used or _blocked(frame["frame"], used, [], minimum):
+        for frame in usable:
+            if frame["frame"] in used or frame["frame"] in manual or _blocked(frame["frame"], used, manual, minimum):
                 continue
-            if any(_alike(frame, core, limit) and not _mouth_saves(frame, core, settings) for core in cores):
+            if any(_alike(frame, core, limit) and drawing_change(frame, core) < structure
+                   and not _mouth_saves(frame, core, settings) for core in list(cores) + chosen):
                 continue
             pool.append(frame)
         if not pool:
             continue
-        best = min(pool, key=lambda frame: (abs(frame["frame"] - point), -frame["sharpness"]))
+        best = min(pool, key=lambda frame: (abs(frame["frame"] - point), not frame.get("hold"), -frame["sharpness"]))
         chosen.append(best)
         used.add(best["frame"])
     return chosen
@@ -304,10 +347,21 @@ def _bounds(settings, low_key, high_key):
     return low, high
 
 
-def _pages(proposals):
+def core_target(settings):
+    """The optional Core average, bounded by the per-page Core limits."""
+    value = float(setting(settings, "core_page_target"))
+    if not isfinite(value) or value <= 0:
+        return 0.0
+    low, high = _bounds(settings, "core_page_min", "core_page_max")
+    low = max(1, low)
+    return min(max(value, low), max(low, high))
+
+
+def _pages(proposals, include_leading_extras=False):
     pages, current = [], []
     for proposal in proposals:
-        if proposal["color"] == PAGE and current:
+        if (proposal["color"] == PAGE and current
+                and (not include_leading_extras or any(item["color"] in (PAGE, CORE) for item in current))):
             pages.append(current)
             current = []
         current.append(proposal)
@@ -316,8 +370,134 @@ def _pages(proposals):
     return pages
 
 
+def _page_limits(settings, minutes):
+    low = max(1, int(setting(settings, "target_pages_min")))
+    high = max(1, int(setting(settings, "target_pages_max")))
+    low, high = min(low, high), max(low, high)
+    episode = float(setting(settings, "episode_minutes") or 0)
+    scale = float(minutes) / episode if minutes and episode > 0 else 1.0
+    return max(1, int(round(low * scale))), max(1, int(round(high * scale)))
+
+
+def _page_priority(item, settings):
+    # A strong visual cut wins when two divisions balance the Core count equally.
+    strength = float(item.get("strength") or 0) / max(1.0, float(setting(settings, "scene_grey")))
+    return min(4.0, max(0.0, strength)) + (0.25 if item["color"] == PAGE else 0.0)
+
+
+def _balanced_boundaries(cores, count, low, high, gap, settings):
+    """Partition existing Core images; count balance comes before scene preference."""
+    total = len(cores)
+    costs, parents = {0: (0, 0.0)}, []
+    for page in range(count):
+        remaining = count - page - 1
+        following, previous = {}, {}
+        for start, cost in costs.items():
+            first = max(start + low, total - remaining * high)
+            last = min(start + high, total - remaining * low)
+            for end in range(first, last + 1):
+                if end < total and int(cores[end]["frame"]) - int(cores[start]["frame"]) < gap:
+                    continue
+                priority = _page_priority(cores[end], settings) if end < total else 0.0
+                candidate = (cost[0] + ((end - start) * count - total) ** 2, cost[1] - priority)
+                if end not in following or candidate < following[end]:
+                    following[end], previous[end] = candidate, start
+        costs = following
+        parents.append(previous)
+        if not costs:
+            return None
+    if total not in costs:
+        return None
+    starts, end = [], total
+    for previous in reversed(parents):
+        end = previous[end]
+        starts.append(end)
+    return sorted(starts)
+
+
+def _spaced_boundaries(cores, count, gap, settings):
+    """Fallback when the time gap prevents a division within the Core bounds."""
+    latest = [len(cores) - 1]
+    for _ in range(count - 1):
+        end = latest[-1]
+        latest.append(max(index for index in range(end)
+                          if int(cores[end]["frame"]) - int(cores[index]["frame"]) >= gap))
+    latest.reverse()
+    starts = [0]
+    for page in range(1, count):
+        first = starts[-1] + 1
+        pool = [index for index in range(first, latest[page] + 1)
+                if int(cores[index]["frame"]) - int(cores[starts[-1]]["frame"]) >= gap]
+        ideal = page * len(cores) / count
+        starts.append(min(pool, key=lambda index: (abs(index - ideal), -_page_priority(cores[index], settings))))
+    return starts
+
+
+def _fit_core_story(proposals, settings, shot_count, minutes):
+    cores = [item for item in proposals if item["color"] in (PAGE, CORE)]
+    if not cores:
+        return proposals, []
+    average = core_target(settings)
+    low, high = _page_limits(settings, minutes)
+    ratio = len(cores) / average
+    wanted = min({max(1, floor(ratio)), max(1, ceil(ratio))},
+                 key=lambda pages: (abs(len(cores) / pages - average), pages))
+    count = max(low, min(wanted, high))
+    core_low, core_high = _bounds(settings, "core_page_min", "core_page_max")
+    core_low, core_high = max(1, core_low), max(1, core_low, core_high)
+    feasible_low = max(low, ceil(len(cores) / core_high))
+    feasible_high = min(high, len(cores) // core_low)
+    if feasible_low <= feasible_high:
+        count = max(feasible_low, min(wanted, feasible_high))
+    # The mean sets the low-compression density. Stronger compression still
+    # reduces page count toward the configured lower bound; per-page selection
+    # can discard Core candidates rather than forcing more pages to hold them.
+    compression = min(1.0, max(0.0, float(setting(settings, "compression"))))
+    count = max(low, min(high, int(round(count + (low - count) * compression))))
+    warnings = []
+    if wanted < low or wanted > high:
+        warnings.append(
+            f"Keeping all {len(cores)} Core candidates near {average:g} per page suggests {wanted} pages; "
+            f"the page limits allow {low}–{high}. Core selection adapts within the per-page limits."
+        )
+    gap = gap_frames(settings, "min_green_seconds")
+    spaced = [0]
+    for index in range(1, len(cores)):
+        if int(cores[index]["frame"]) - int(cores[spaced[-1]]["frame"]) >= gap:
+            spaced.append(index)
+    available = min(len(cores), max(1, int(shot_count or 1)), len(spaced))
+    if count > available:
+        warnings.append(f"{available} pages instead of {count}: available images, shots or the minimum page gap stop there.")
+        count = available
+    # If the page range makes the Core limits impossible, retain all candidates
+    # here. Only the existing Core/total ceilings may remove them afterwards.
+    split_low = min(core_low, max(1, len(cores) // count))
+    split_high = max(core_high, ceil(len(cores) / count))
+    # The floor/ceiling lengths attain the best possible balance. Try that small
+    # search first; widening is only useful when timestamps prevent those sizes.
+    starts = _balanced_boundaries(cores, count, max(split_low, len(cores) // count),
+                                  min(split_high, ceil(len(cores) / count)), gap, settings)
+    if starts is None:
+        starts = _balanced_boundaries(cores, count, split_low, split_high, gap, settings)
+    if starts is None:
+        starts = _spaced_boundaries(cores, count, gap, settings)
+        warnings.append("The minimum page gap prevents an even Core distribution; per-page bounds may limit the result.")
+    chosen = {int(cores[index]["frame"]) for index in starts}
+    fitted = []
+    for item in proposals:
+        updated = dict(item)
+        if item["color"] == PAGE and int(item["frame"]) not in chosen:
+            updated.update(color=CORE, name=NAMES[CORE], rule="body", note="Core")
+        elif item["color"] == CORE and int(item["frame"]) in chosen:
+            updated.update(color=PAGE, name=NAMES[PAGE], rule="page", note="Page start")
+        fitted.append(updated)
+    return fitted, warnings
+
+
 def _fit_story(proposals, settings, shot_count, minutes=None):
     """Keep about as many page opens as the compression slider asks for."""
+    if core_target(settings):
+        return _fit_core_story(proposals, settings, shot_count, minutes)
     greens = [proposal for proposal in proposals if proposal["color"] == PAGE]
     if len(greens) < 1:
         return proposals, []
@@ -366,9 +546,13 @@ def _trim_pages(proposals, settings):
     """A floor and a ceiling for corps images, and for every image on the page."""
     core_min, core_max = _bounds(settings, "core_page_min", "core_page_max")
     total_min, total_max = _bounds(settings, "total_page_min", "total_page_max")
+    average = core_target(settings)
+    # A margin of one image keeps this an average to approach, rather than an
+    # exact quota. Existing floors take precedence; only Core images are ranked.
+    soft_max = max(core_min, min(core_max, floor(average + 1))) if average else None
     warnings = []
     kept_pages = []
-    for page in _pages(proposals):
+    for page in _pages(proposals, include_leading_extras=bool(core_target(settings))):
         kept = list(page)
 
         def cores():
@@ -382,6 +566,16 @@ def _trim_pages(proposals, settings):
             if not pool or len(cores()) - 1 < core_min:
                 break
             kept.remove(sacrifice(pool))
+        if soft_max is not None:
+            while len(cores()) > soft_max:
+                pool = [item for item in kept if item["color"] == CORE]
+                if not pool or len(cores()) - 1 < core_min or len(kept) - 1 < total_min:
+                    break
+                kept.remove(sacrifice(pool))
+            if len(cores()) > soft_max:
+                warnings.append(
+                    f"Page at frame {kept[0]['frame']}: the image minimum keeps the Core average above its target."
+                )
         while len(kept) > total_max:
             extras = [item for item in kept if item["color"] == EXTRA]
             pool = extras or [item for item in kept if item["color"] == CORE]
@@ -400,6 +594,15 @@ def _trim_pages(proposals, settings):
                 f"Page at frame {kept[0]['frame']}: the minimum keeps the page above the maximum."
             )
         kept_pages.extend(kept)
+    if average:
+        page_count = sum(item["color"] == PAGE for item in kept_pages)
+        core_count = sum(item["color"] in (PAGE, CORE) for item in kept_pages)
+        actual = core_count / page_count if page_count else 0.0
+        if page_count and abs(actual - average) > 1.000001:
+            warnings.append(
+                f"Core target {average:g} per page: {core_count} Core images over {page_count} pages "
+                f"give {actual:.2f}. Available images, page limits or image minimums prevent a closer average."
+            )
     return kept_pages, warnings
 
 
@@ -456,9 +659,8 @@ def propose(analysis, settings):
                    for frame, kind in speech_picks]
         if body is not None:
             records.append((body, body_kind, CORE))
-        duration = (shot["end"] - shot["start"]) / fps
-        if duration <= float(setting(settings, "action_max_seconds")) and float(shot.get("motion") or 0) >= float(setting(settings, "action_motion")):
-            for extra in _spread(frames, shot, int(setting(settings, "action_extras")), taken, settings, cores, best):
+        if action_shot(shot, frames, settings):
+            for extra in _spread(frames, shot, int(setting(settings, "action_extras")), taken, settings, cores, best, manual):
                 records.append((extra, "action", EXTRA))
                 taken.append(extra["frame"])
         target = body

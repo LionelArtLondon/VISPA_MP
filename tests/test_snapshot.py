@@ -58,9 +58,11 @@ def test_markers_come_back_in_timeline_frames_and_go_out_as_offsets(qapp):
     assert snapshot["markers"][0]["frame"] == 188822
     from vispa_mp.ui import MainWindow
     window = MainWindow(client=None)
+    snapshot["timeline_identity"] = {"project_id": "project-1", "timeline_id": "timeline-1"}
     window.snapshot = snapshot
     window.proposals = [{"frame": 188900, "color": "Green"}]
-    window.analysis = {"range": [188822, 199480]}
+    window.analysis = {"range": [188822, 199480], "timeline_identity": snapshot["timeline_identity"],
+                       "timebase": {"start_frame": snapshot["start_frame"]}}
     window.set_setting("use_in_out", True)
     payload = window.resolve_payload()
     assert payload["proposals"] == [{"frame": 8900, "color": "Green"}]

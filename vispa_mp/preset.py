@@ -1,6 +1,7 @@
 """Tunable thresholds. A saved JSON overrides these defaults one key at a time."""
 
 from json import loads
+import math
 from pathlib import Path
 
 DEFAULTS = {
@@ -29,6 +30,8 @@ DEFAULTS = {
     "action_max_seconds": 2.5,
     "action_motion": 12.0,
     "action_extras": 3,
+    "min_extra_seconds": 0.12,
+    "action_structure": 0.35,
     "duplicate_diff": 6.0,
     "scene_grey": 30.0,
     "scene_colour": 0.35,
@@ -43,6 +46,8 @@ DEFAULTS = {
     "target_pages_max": 60,
     "core_page_min": 2,
     "core_page_max": 6,
+    # A soft average for Page + Core images. Zero keeps the compression slider.
+    "core_page_target": 0.0,
     "total_page_min": 3,
     "total_page_max": 8,
     "skip_marked_shots": True,
@@ -72,7 +77,26 @@ def load(path=None):
 
 # What the user changed, kept between sessions. default.json is never rewritten.
 USER_PATH = ROOT / "presets" / "user.json"
-VIEW_DEFAULTS = {"page_format": "A5", "orientation": "portrait", "custom_width": 148, "custom_height": 210}
+FRAME_FORMATS = ("Source", "16:9", "4:3", "3:2", "1:1", "2:3", "9:16", "Custom")
+PREVIEW_DEFAULTS = {"show_board_labels": True, "frame_format": "Source",
+                    "frame_custom_width": 16.0, "frame_custom_height": 9.0}
+VIEW_DEFAULTS = {"page_format": "A5", "orientation": "portrait", "custom_width": 148, "custom_height": 210,
+                 **PREVIEW_DEFAULTS}
+
+
+def _valid_preview_value(key, value):
+    if key == "show_board_labels":
+        return isinstance(value, bool)
+    if key == "frame_format":
+        return isinstance(value, str) and value in FRAME_FORMATS
+    if key in ("frame_custom_width", "frame_custom_height"):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return False
+        try:
+            return math.isfinite(value) and 0.1 <= value <= 100
+        except OverflowError:
+            return False
+    return True
 
 
 def _same_kind(value, reference):
@@ -101,7 +125,8 @@ def load_user(path=None):
     for key, value in _read_user(path or USER_PATH).items():
         if key in DEFAULTS and _same_kind(value, DEFAULTS[key]):
             settings[key] = value
-        elif key in VIEW_DEFAULTS and _same_kind(value, VIEW_DEFAULTS[key]):
+        elif (key in VIEW_DEFAULTS and _same_kind(value, VIEW_DEFAULTS[key])
+              and _valid_preview_value(key, value)):
             view[key] = value
     return settings, view
 
@@ -150,7 +175,7 @@ def save_user(settings, view, path=None):
         if key in DEFAULTS and value != shipped.get(key):
             changed[key] = value
     for key, value in (view or {}).items():
-        if key in VIEW_DEFAULTS and value != VIEW_DEFAULTS[key]:
+        if key in VIEW_DEFAULTS and value != VIEW_DEFAULTS[key] and _valid_preview_value(key, value):
             changed[key] = value
     target = Path(path or USER_PATH)
     if not changed:

@@ -13,9 +13,10 @@ from vispa_mp.shots import build_shots
 from vispa_mp.speech import Silero, map_turns, turns_from_probs
 from vispa_mp.store import ScoreStore, load_analysis, save_analysis
 from vispa_mp.tags import Tagger, model_id
+from vispa_mp.timeline_identity import normalize_identity
 
 # Raise this when the content of an analysis changes: saved ones are then redone.
-ANALYSIS_VERSION = 1
+ANALYSIS_VERSION = 2
 # Settings that change which frames are examined. The others only change the rules.
 # The speech settings are left out: the review already redraws the lines from the
 # saved probabilities, so changing them never asked for a new analysis.
@@ -148,6 +149,9 @@ def _media_of(clip):
 def analysis_key(snapshot, settings):
     """Names an analysis by everything that went into it. None when a media file is missing."""
     from vispa_mp.models_setup import WD_ONNX
+    identity = normalize_identity(snapshot.get("timeline_identity"))
+    if identity is None:
+        return None
     media = []
     for clip in list(snapshot.get("video_clips") or []) + list(snapshot.get("audio_clips") or []):
         described = _media_of(clip)
@@ -159,6 +163,7 @@ def analysis_key(snapshot, settings):
     span, _notes = _range_of(snapshot, settings)
     raw = json.dumps({
         "version": ANALYSIS_VERSION,
+        "timeline_identity": identity,
         "tagger": model_id(WD_ONNX),
         "fps": snapshot.get("fps"),
         "start_frame": snapshot.get("start_frame"),
@@ -171,10 +176,15 @@ def analysis_key(snapshot, settings):
 
 def _for_snapshot(analysis, snapshot):
     """A saved analysis, with what may have changed in Resolve since: hand markers and name."""
+    identity = normalize_identity(analysis.get("timeline_identity"))
+    if identity is None or identity != normalize_identity(snapshot.get("timeline_identity")):
+        return None
     restored = dict(analysis)
+    restored["timeline_identity"] = identity
     restored["manual_frames"] = [int(marker["frame"]) for marker in snapshot.get("markers") or []
                                  if not marker.get("automatic")]
     restored["timeline_name"] = snapshot.get("timeline_name") or restored.get("timeline_name") or ""
+    restored["project_name"] = snapshot.get("project_name") or restored.get("project_name") or ""
     restored["restored"] = True
     return restored
 
@@ -198,8 +208,9 @@ def analyze(snapshot, settings, sources=None, progress=None, cancel=None, store=
     key = analysis_key(snapshot, settings) if store is not None else None
     if key is not None:
         found = load_analysis(store, key)
-        if found:
-            return _for_snapshot(found, snapshot)
+        restored = _for_snapshot(found, snapshot) if found else None
+        if restored:
+            return restored
     sources = sources or Live(snapshot.get("cache"), steps, cancel)
     fps = float(snapshot["fps"])
     warnings = list(snapshot.get("warnings") or [])
@@ -256,6 +267,8 @@ def analyze(snapshot, settings, sources=None, progress=None, cancel=None, store=
         "manual_frames": manual,
         "warnings": warnings,
         "timeline_name": snapshot.get("timeline_name") or "",
+        "project_name": snapshot.get("project_name") or "",
+        "timeline_identity": normalize_identity(snapshot.get("timeline_identity")),
     }
     if key is not None:
         result["key"] = key

@@ -1,8 +1,8 @@
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QPushButton, QStyle, QStyleOptionSlider, QToolButton
+from PySide6.QtWidgets import QFrame, QPushButton, QStyle, QStyleOptionSlider, QToolButton
 
-from vispa_mp.ui import MainWindow
+from vispa_mp.ui import MainWindow, item_frame
 
 
 def _frame(number, **overrides):
@@ -321,11 +321,40 @@ def test_the_board_zooms_and_pans(qapp):
     assert board.offset.x() != 0 or board.offset.y() != 0
 
 
+def test_arrows_move_the_selected_image_until_suggestions_are_opened(qapp):
+    window = _review(qapp)
+    images = [(item_frame(item), item["manual"]) for item in window._navigable_items()]
+    window._choose_frame(*images[0])
+    assert window.suggestion_area.isHidden()
+    window._arrow(1)
+    assert (window.selected_frame, window.selected_manual) == images[1]
+    assert window.playhead_frame == images[1][0]
+    assert window.suggestion_area.isHidden()
+    proposal = images[1] if not images[1][1] else next(key for key in images if not key[1])
+    if (window.selected_frame, window.selected_manual) != proposal:
+        window._choose_frame(*proposal)
+    card = window.thumb_area.widget().findChild(QFrame, f"thumb-{proposal[0]}-a")
+    QTest.mouseDClick(card, Qt.MouseButton.LeftButton)
+    assert window.suggestion_area.isVisible()
+    assert window.selected_frame == proposal[0]
+    window._set_mode("board")
+    assert window.suggestion_area.isVisible()
+    window._cancel_preview()
+    assert window.suggestion_area.isHidden()
+    window.board.resize(500, 700)
+    window.board.grab()
+    proposal = next(item for _rect, item in window.board._hits if not item["manual"])
+    window.board.opened.emit(item_frame(proposal), False)
+    assert window.suggestion_area.isVisible()
+    assert window.selected_frame == item_frame(proposal)
+
+
 def test_arrows_preview_a_suggestion_and_enter_keeps_it(qapp):
     window = _review(qapp)
     page = window.pages[0]
     marker = next(item["proposal"] for item in page["items"] if not item["manual"])
-    window._choose_frame(marker["frame"], False)
+    window._open_suggestions(marker["frame"], False)
+    assert window.suggestion_area.isVisible()
     frames = [int(frame["frame"]) for frame in window._suggestion_frames()]
     assert len(frames) > 1
     step = -1 if frames[-1] == marker["frame"] else 1  # towards an image that is not the kept one

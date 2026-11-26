@@ -141,6 +141,7 @@ def _snapshot(media, markers=()):
     return {
         "fps": 24, "start_frame": 0, "end_frame": 10, "start_timecode": "00:00:00:00", "drop": False,
         "timeline_name": "Episode", "video_clips": [clip], "audio_clips": [],
+        "timeline_identity": {"project_id": "project-1", "timeline_id": "timeline-1"},
         "markers": list(markers), "mark_in": None, "mark_out": None, "warnings": [],
     }
 

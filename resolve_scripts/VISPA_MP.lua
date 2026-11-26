@@ -6,8 +6,9 @@
 
 local MAILBOX = [[__MAILBOX__]]
 local AUTOMATIC = "vispa-mp"
+local MARKER_NAMES = { Green = "Page", Blue = "Core", Cyan = "Extra" }
 -- VISPA MP asks for this version: an older copy still running in Resolve is told to restart.
-local SCRIPT_VERSION = 2
+local SCRIPT_VERSION = 5
 local POLL_SECONDS = 0.25
 local STALE_SECONDS = 300
 local STARTED = os.time()
@@ -202,6 +203,37 @@ local function trim(value)
   return (tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
+local function normalize_identity(value)
+  if type(value) ~= "table" then return nil end
+  local project_id, timeline_id = value.project_id, value.timeline_id
+  if type(project_id) ~= "string" or trim(project_id) == ""
+      or type(timeline_id) ~= "string" or trim(timeline_id) == "" then
+    return nil
+  end
+  return { project_id = project_id, timeline_id = timeline_id }
+end
+
+local function timeline_identity(timeline, project)
+  return normalize_identity({
+    project_id = call(project, "GetUniqueId"),
+    timeline_id = call(timeline, "GetUniqueId"),
+  })
+end
+
+local function require_timeline(timeline, project, expected)
+  expected = normalize_identity(expected)
+  if not expected then
+    error("The analysis has no verified timeline identity. Read the timeline and analyze again before placing markers.")
+  end
+  local actual = timeline_identity(timeline, project)
+  if not actual then
+    error("Resolve could not identify the current project and timeline. No markers were changed.")
+  end
+  if actual.project_id ~= expected.project_id or actual.timeline_id ~= expected.timeline_id then
+    error("The active Resolve timeline is not the analyzed timeline. Return to the analyzed timeline before placing markers. No markers were changed.")
+  end
+end
+
 local function parse_fps(raw)
   if type(raw) == "number" and raw ~= 0 then return raw end
   local text = trim(raw)
@@ -341,7 +373,7 @@ local function cue_warning(names)
   return ""
 end
 
-local function read_timeline(timeline)
+local function read_timeline(timeline, project)
   if timeline == nil then error("No timeline is open.") end
   local start_frame = math.floor(tonumber(call(timeline, "GetStartFrame")) or 0)
   local setting = call(timeline, "GetSetting", "timelineFrameRate")
@@ -362,8 +394,12 @@ local function read_timeline(timeline)
   local audio = audio_count >= 1 and clips_on(timeline, "audio", 1) or array({})
   if #video == 0 then warnings[#warnings + 1] = "Video 1 has no clip linked to a file." end
   if #audio == 0 then warnings[#warnings + 1] = "Audio 1 has no clip linked to a file. Lines will not be detected." end
+  local project_name = call(project, "GetName")
+  if type(project_name) ~= "string" then project_name = "" end
   local result = {
+    project_name = project_name,
     timeline_name = call(timeline, "GetName") or "",
+    timeline_identity = timeline_identity(timeline, project),
     start_frame = start_frame,
     end_frame = math.floor(tonumber(call(timeline, "GetEndFrame")) or 0),
     fps = fps,
@@ -411,23 +447,71 @@ local function plan_apply(existing, proposals, start_frame, end_frame)
   return array(delete), array(add), array(skipped)
 end
 
-local function apply_markers(timeline, proposals, start_frame, end_frame)
-  local delete, add, skipped = plan_apply(markers_of(timeline), proposals, start_frame, end_frame)
+local function apply_markers(timeline, proposals, start_frame, end_frame, expected, project)
+  -- Check the captured Resolve objects before even reading markers; never reacquire
+  -- the active timeline between this check and the mutations below.
+  require_timeline(timeline, project, expected)
+  local outside, eligible = {}, 0
+  for _, proposal in ipairs(proposals or {}) do
+    local frame = math.floor(tonumber(proposal.frame) or 0)
+    if in_range(frame, start_frame, end_frame) then
+      if not MARKER_NAMES[proposal.color] then error("Unsupported marker color. No markers were changed.") end
+      eligible = eligible + 1
+    else
+      outside[#outside + 1] = frame
+    end
+  end
+  if eligible == 0 then
+    return { verified = true, requested = #(proposals or {}), attempted = 0,
+      deleted = array({}), placed = array({}), skipped = array({}), failed = array({}), outside = array(outside) }
+  end
+  local existing = markers_of(timeline)
+  local delete, add, skipped = plan_apply(existing, proposals, start_frame, end_frame)
+  table.sort(add, function(a, b) return tonumber(a.frame) < tonumber(b.frame) end)
+  -- Reuse numbers when replacing a range, while preserving names on markers
+  -- kept by this operation (manual markers and automatic markers outside it).
+  local deleting, reserved = {}, {}
+  for _, frame in ipairs(delete) do deleting[frame] = true end
+  for _, marker in ipairs(existing) do
+    if not deleting[marker.frame] then reserved[string.lower(marker.name or "")] = true end
+  end
+  local names, number = {}, 1
+  for _, proposal in ipairs(add) do
+    while reserved[string.format("marqueur-%03d", number)] do number = number + 1 end
+    local name = string.format("marqueur-%03d", number)
+    names[math.floor(tonumber(proposal.frame) or 0)] = name
+    reserved[name] = true
+    number = number + 1
+  end
   for _, frame in ipairs(delete) do
     call(timeline, "DeleteMarkerAtFrame", frame)
   end
-  local placed = {}
+  local placed, failed = {}, {}
   local left = {}
   for index = 1, #skipped do left[index] = skipped[index] end
   for _, proposal in ipairs(add) do
     local frame = math.floor(tonumber(proposal.frame) or 0)
     local color = proposal.color or ""
-    local ok = call(timeline, "AddMarker", frame, color, "", "", 1, AUTOMATIC)
-    if not ok then ok = call(timeline, "AddMarker", frame, color, "", "", 1) end
-    if ok then placed[#placed + 1] = frame
-    else left[#left + 1] = frame end
+    -- Resolve refuses an empty marker name, including on the real 25i timeline.
+    -- Keep customData on every call so a failed write never becomes a manual marker.
+    call(timeline, "AddMarker", frame, color, names[frame], "", 1, AUTOMATIC)
   end
-  return { deleted = array(delete), placed = array(placed), skipped = array(left) }
+  local actual = {}
+  for _, marker in ipairs(markers_of(timeline)) do actual[marker.frame] = marker end
+  for _, proposal in ipairs(add) do
+    local frame = math.floor(tonumber(proposal.frame) or 0)
+    local marker = actual[frame]
+    if marker and marker.color == proposal.color and marker.name == names[frame]
+        and marker.custom_data == AUTOMATIC then
+      placed[#placed + 1] = frame
+    else
+      failed[#failed + 1] = frame
+      left[#left + 1] = frame
+    end
+  end
+  return { verified = true, requested = #(proposals or {}), attempted = #add,
+    deleted = array(delete), placed = array(placed), skipped = array(left),
+    failed = array(failed), outside = array(outside) }
 end
 
 local function current_timeline()
@@ -439,7 +523,7 @@ local function current_timeline()
   if not project then error("No project is open.") end
   local timeline = call(project, "GetCurrentTimeline")
   if not timeline then error("No timeline is open.") end
-  return timeline
+  return timeline, project
 end
 
 local function timeline_name()
@@ -450,17 +534,20 @@ local function timeline_name()
   return ""
 end
 
-local function dispatch(command, timeline)
+local function dispatch(command, timeline, project)
   local name = command.cmd
   if name == "ping" then return { ok = true } end
   if name == "stop" then return { ok = true, stopping = true } end
-  if name == "read" then return read_timeline(timeline) end
+  if name == "read" then return read_timeline(timeline, project) end
   if name == "seek" then
     local ok = call(timeline, "SetCurrentTimecode", command.timecode)
     return { ok = ok and true or false, timecode = command.timecode or "" }
   end
   if name == "apply" then
-    return apply_markers(timeline, command.proposals, command.start, command["end"])
+    error("Unchecked marker placement is no longer supported. Update VISPA MP and read the timeline again.")
+  end
+  if name == "apply_checked" then
+    return apply_markers(timeline, command.proposals, command.start, command["end"], command.expected_timeline, project)
   end
   error("Unknown command: " .. tostring(name))
 end
@@ -533,9 +620,9 @@ local function handle_once()
   last_id = id
   if is_stale(request, os.time()) then return false end
   local ran, result = pcall(function()
-    local timeline = nil
-    if request.cmd ~= "ping" and request.cmd ~= "stop" then timeline = current_timeline() end
-    return dispatch(request, timeline)
+    local timeline, project = nil, nil
+    if request.cmd ~= "ping" and request.cmd ~= "stop" then timeline, project = current_timeline() end
+    return dispatch(request, timeline, project)
   end)
   local response
   if ran then response = { id = request.id, ok = true, result = result }
@@ -576,6 +663,32 @@ local function self_check()
     { { frame = 1, color = "Blue" }, { frame = 3, color = "Cyan" } },
     0, 10)
   assert(delete[1] == 2 and add[1].frame == 3 and skipped[1] == 1)
+  local reads, mutations, test_markers = 0, 0, {}
+  local timeline = {
+    GetUniqueId = function() return "timeline-a" end,
+    GetMarkers = function() reads = reads + 1; return test_markers end,
+    DeleteMarkerAtFrame = function() mutations = mutations + 1 end,
+    AddMarker = function(_, frame, color, name, note, duration, custom)
+      mutations = mutations + 1
+      if not name or name == "" then return false end
+      test_markers[frame] = { color = color, name = name, note = note, duration = duration, customData = custom }
+      return true
+    end,
+  }
+  local project = { GetUniqueId = function() return "project-a" end }
+  local function rejected(command)
+    assert(not pcall(dispatch, command, timeline, project))
+    assert(reads == 0 and mutations == 0)
+  end
+  rejected({ cmd = "apply", proposals = { { frame = 3, color = "Green" } } })
+  rejected({ cmd = "apply_checked", expected_timeline = { project_id = "project-a", timeline_id = "timeline-b" } })
+  rejected({ cmd = "apply_checked", expected_timeline = { project_id = "project-b", timeline_id = "timeline-a" } })
+  rejected({ cmd = "apply_checked" })
+  rejected({ cmd = "apply_checked", expected_timeline = { project_id = "project-a", timeline_id = " " } })
+  rejected({ cmd = "apply_checked", expected_timeline = { project_id = "project-a", timeline_id = 1 } })
+  local placed = dispatch({ cmd = "apply_checked", expected_timeline = { project_id = "project-a", timeline_id = "timeline-a" },
+    proposals = { { frame = 3, color = "Green" } } }, timeline, project)
+  assert(placed.placed[1] == 3 and mutations == 1)
   assert(dispatch({ cmd = "stop" }, nil).stopping == true)
   assert(is_stale({ id = "1700000000000000000" }, 1700000000 + 301) == true)
   assert(is_stale({ id = "1700000000000000000" }, 1700000000 + 10) == false)

@@ -260,8 +260,9 @@ class MailboxClient:
     def seek(self, timecode):
         return self.request("seek", timecode=timecode)
 
-    def apply(self, proposals, start=None, end=None):
-        return self.request("apply", proposals=proposals, start=start, end=end)
+    def apply(self, proposals, start=None, end=None, expected_timeline=None):
+        return self.request("apply_checked", proposals=proposals, start=start, end=end,
+                            expected_timeline=expected_timeline)
 
     def close(self):
         return None

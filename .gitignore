@@ -6,4 +6,5 @@ models/
 tools/
 *.pyc
 presets/user.json
+presets/project_locations.json
 presets/saved/
