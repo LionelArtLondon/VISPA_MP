@@ -47,7 +47,7 @@ def test_a_suggestion_menu_adds_a_marker_without_replacing_the_original(qapp, mo
     assert added["color"] == color
     assert added["name"] == NAMES[color]
     assert added["rule"] == "user"
-    assert window.selected_frame == 12
+    assert window.selected_frame == 22
     assert window.selected_manual is False
     assert window._project_dirty is True
     assert window.mode == mode
@@ -87,10 +87,10 @@ def test_right_click_opens_the_suggestion_menu_without_accepting_its_image(qapp,
     point = QPoint(8, 8)
     card.customContextMenuRequested.emit(point)
 
-    assert opened == [["Add Extra marker", "Add Core marker", "Start a new page here"]]
+    assert opened == [["Add Extra marker", "Add Core marker", "Start a new page here", "", "Use as replacement"]]
     assert window.proposals == original
     assert window.selected_frame == 22
-    assert window._preview == 2
+    assert window._preview == 12  # The new context target and its non-destructive preview agree.
     assert window._project_dirty is False
 
 
@@ -132,7 +132,7 @@ def test_adding_an_extra_makes_it_visible_when_the_current_filter_hides_extras(q
     window._add_suggestion_marker(12)
     assert window.view_filter == "all"
     assert window.filter_buttons["all"].isChecked()
-    assert window.selected_frame == 12
+    assert window.selected_frame == 22
     assert window._proposal(12)["color"] == EXTRA
     assert window.mode == mode
 
@@ -206,7 +206,7 @@ def test_project_save_and_restore_keep_extra_candidates_and_their_manual_choice(
     assert restored._proposal(2)["rule"] == "user"
     assert restored._proposal(2)["color"] == EXTRA
     assert restored._proposal(12)["color"] == original[0]["color"]
-    assert restored.selected_frame == 2
+    assert restored.selected_frame == 12
     assert restored._project_dirty is False
     restored.recompute()
     assert restored._proposal(2)["rule"] == "user"

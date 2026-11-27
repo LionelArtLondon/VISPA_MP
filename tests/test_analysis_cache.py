@@ -196,15 +196,22 @@ def test_the_analyze_button_becomes_cancel_while_it_runs(qapp, monkeypatch):
     monkeypatch.setattr("vispa_mp.ui.analyze", slow)
     window = MainWindow(client=None)
     window.snapshot = {"fps": 24, "video_clips": []}
+    analyze_icon = window.analyze_button.icon().pixmap(16, 16).toImage()
     window.analyze_button.click()
-    assert window.analyze_button.text() == "Cancel"
+    assert window.analyze_button.text() == ""
+    assert window.analyze_button.accessibleName() == "Cancel analysis"
+    assert "Stop the current analysis" in window.analyze_button.toolTip()
+    assert window.analyze_button.icon().pixmap(16, 16).toImage() != analyze_icon
     window.analyze_button.click()
     deadline = time.time() + 5
     while window.worker is not None and time.time() < deadline:
         qapp.processEvents()
         time.sleep(0.01)
     qapp.processEvents()
-    assert window.analyze_button.text() == "Analyze"
+    assert window.analyze_button.text() == ""
+    assert window.analyze_button.accessibleName() == "Analyze"
+    assert "propose markers" in window.analyze_button.toolTip()
+    assert window.analyze_button.icon().pixmap(16, 16).toImage() == analyze_icon
     assert "Analysis stopped" in window.status.text()
 
 

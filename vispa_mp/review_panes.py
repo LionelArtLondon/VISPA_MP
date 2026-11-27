@@ -1,7 +1,81 @@
 """Resizable review panes shared by Strip and Board."""
 
 from PySide6.QtCore import QEvent, Qt, QTimer, Signal
-from PySide6.QtWidgets import QScrollArea, QSplitter, QWidget
+from PySide6.QtGui import QColor, QPainter
+from PySide6.QtWidgets import QScrollArea, QSplitter, QSplitterHandle, QWidget
+
+from vispa_mp.ui_tokens import ACCENT, BORDER_ROW, PANEL_BG, SEPARATOR
+
+
+class WorkspaceSplitterHandle(QSplitterHandle):
+    """A narrow visible divider with a wider native drag target."""
+
+    def __init__(self, parent):
+        super().__init__(Qt.Orientation.Horizontal, parent)
+        self._hovered = False
+        self._pressed = False
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.SplitHCursor)
+        self.setAccessibleName("Resize workspace panels")
+        self.setToolTip("Drag to resize panels")
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(PANEL_BG))
+        color = ACCENT if self._pressed else SEPARATOR if self._hovered else BORDER_ROW
+        painter.fillRect((self.width() - 2) // 2, 0, 2, self.height(), QColor(color))
+
+    def enterEvent(self, event):
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and not self._pressed:
+            self._pressed = True
+            self.update()
+            self.splitter().resize_started.emit()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._hovered = self.rect().contains(event.position().toPoint())
+            self._finish_resize()
+
+    def _finish_resize(self):
+        if self._pressed:
+            self._pressed = False
+            self.update()
+            self.splitter().resize_finished.emit()
+
+    def event(self, event):
+        if event.type() in (QEvent.Type.Hide, QEvent.Type.WindowDeactivate, QEvent.Type.UngrabMouse):
+            self._hovered = False
+            self._finish_resize()
+        return super().event(event)
+
+
+class WorkspaceSplitter(QSplitter):
+    """Horizontal Pages / canvas / tools layout; only the canvas stretches."""
+
+    resize_started = Signal()
+    resize_finished = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(Qt.Orientation.Horizontal, parent)
+        self.setObjectName("workspaceSplitter")
+        self.setChildrenCollapsible(False)
+        self.setHandleWidth(8)
+        self.setOpaqueResize(True)
+
+    def createHandle(self):
+        return WorkspaceSplitterHandle(self)
 
 
 class ReviewSplitter(QSplitter):

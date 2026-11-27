@@ -113,27 +113,40 @@ def reconcile_layout(layout, proposals):
     return pages
 
 
-def move_frame(layout, frame, target_page_id, before_frame=None):
-    """Move one proposal to a stable page ID; ``None`` appends to its end.
+def move_frames(layout, frames, target_page_id, before_frame=None):
+    """Move proposals together in their current reading order.
 
     The target is resolved before removing an empty source page, so moving a
     lone first-page image into a later page cannot shift the destination. Invalid
     targets raise ``ValueError`` and leave every caller-owned structure intact.
+    An insertion image in the moving group resolves to the next image left in
+    that destination page, or its end when there is no remaining successor.
     """
-    if not _integer(frame) or not _integer(target_page_id):
+    if (not isinstance(frames, (list, tuple)) or not frames
+            or any(not _integer(frame) for frame in frames)
+            or len(set(frames)) != len(frames) or not _integer(target_page_id)):
         raise ValueError("A page move needs integer image and page IDs.")
     if before_frame is not None and not _integer(before_frame):
         raise ValueError("The insertion image must be an integer frame ID.")
     pages = _copy_layout(layout)
-    source = next((page for page in pages if frame in page["frames"]), None)
     target = next((page for page in pages if page["id"] == target_page_id), None)
-    if source is None or target is None:
+    selected = set(frames)
+    ordered = [frame for page in pages for frame in page["frames"] if frame in selected]
+    if len(ordered) != len(selected) or target is None:
         raise ValueError("The image or destination page is no longer available.")
     if before_frame is not None and before_frame not in target["frames"]:
         raise ValueError("The insertion image does not belong to the destination page.")
-    if before_frame == frame:
-        return pages
-    source["frames"].remove(frame)
+    if before_frame in selected:
+        insertion_index = target["frames"].index(before_frame)
+        before_frame = next((frame for frame in target["frames"][insertion_index:]
+                             if frame not in selected), None)
+    for page in pages:
+        page["frames"] = [frame for frame in page["frames"] if frame not in selected]
     position = len(target["frames"]) if before_frame is None else target["frames"].index(before_frame)
-    target["frames"].insert(position, frame)
+    target["frames"][position:position] = ordered
     return [page for page in pages if page["frames"]]
+
+
+def move_frame(layout, frame, target_page_id, before_frame=None):
+    """Move one proposal; retained for existing single-image callers."""
+    return move_frames(layout, [frame], target_page_id, before_frame)

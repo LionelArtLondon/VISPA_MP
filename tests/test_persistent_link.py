@@ -160,14 +160,15 @@ local function new_timeline(id, marks)
   local value = {
   id = id,
   name = "Episode",
+  video_names = { "Animation", "CUE_SOURCE" },
   GetUniqueId = function(self) return self.id end,
   GetName = function(self) return self.name end,
   GetStartFrame = function() return 0 end,
   GetEndFrame = function() return 100 end,
   GetStartTimecode = function() return "00:00:00:00" end,
   GetSetting = function(_, key) if key == "timelineFrameRate" then return "24" end return "0" end,
-  GetTrackCount = function() return 1 end,
-  GetTrackName = function() return "CUE_SOURCE" end,
+  GetTrackCount = function(self, kind) return kind == "video" and #self.video_names or 1 end,
+  GetTrackName = function(self, kind, index) return kind == "video" and self.video_names[index] or "Audio 1" end,
   GetItemListInTrack = function() return {} end,
   GetMarkInOut = function() return {} end,
   GetMarkers = function() return marks end,
@@ -193,6 +194,8 @@ local function new_timeline(id, marks)
     elseif control == "missing-project-id" then project_id = nil
     elseif control == "phantom-success" then self.phantom = true
     elseif control == "restore-writes" then self.phantom = false
+    elseif control == "no-video-track" then self.video_names = {}
+    elseif control == "restore-video-track" then self.video_names = { "Animation", "CUE_SOURCE" }
     elseif control == "reserve-manual-name" then
       marks[5] = { color = "Blue", name = "Marqueur-001", note = "manual", duration = 1, customData = "" }
     end
@@ -248,6 +251,12 @@ def test_the_lua_script_listens_until_told_to_stop(tmp_path, sandbox, menu):
         assert first["timeline_name"] == "Episode"
         assert first["project_name"] == "Comic project"
         assert first["script_version"] == 5 and first["interlaced"] is False
+        assert first["video_track_name"] == "Animation"
+        assert all("CUE_SOURCE" not in warning for warning in first["warnings"])
+        client.seek("no-video-track")
+        assert "Video 1 was not found." in client.read()["warnings"]
+        client.seek("restore-video-track")
+        assert client.read()["warnings"] == first["warnings"]
         identity = {"project_id": "project-a", "timeline_id": "timeline-a"}
         assert first["timeline_identity"] == identity
         proposals = [{"frame": 12, "color": "Green"}]

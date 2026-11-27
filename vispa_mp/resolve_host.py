@@ -42,9 +42,9 @@ def handle_once(resolve, link):
             result = {"ok": True, "stopping": True}
         else:
             timeline = project = None
-            if command != "ping":
+            if command not in ("ping", "learning_library", "learning_open"):
                 timeline, project = _target(resolve)
-            result = dispatch(request, timeline, project)
+            result = dispatch(request, timeline, project, resolve=resolve)
         link.write_response({"id": request.get("id"), "ok": True, "result": result})
     except Exception as error:
         link.write_response({"id": request.get("id"), "ok": False, "error": str(error)})

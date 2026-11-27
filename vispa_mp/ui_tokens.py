@@ -47,6 +47,7 @@ RADIUS = px(4)
 
 # ---- window structure ---------------------------------------------------------------------------------------------
 HEADER_HEIGHT = px(44)
+HEADER_CONTROL = px(24)     # compact toolbar buttons, with breathing room above and below
 FOOTER_HEIGHT = px(36)
 TOOL_COLUMN = px(44)
 TOOL_GAP = px(6)
@@ -92,11 +93,13 @@ ACCENT = '#2FD0C0'
 PRIMARY_BG = '#1FB5A7'
 PRIMARY_TEXT = '#04201D'
 SELECTED_ROW = '#175460'
+PAGE_DROP_BG, PAGE_DROP_ACCENT = '#403623', '#F0C46A'
 ACCEPT_BORDER, ACCEPT_TEXT = '#46C486', '#8BE6B6'
 REJECT_BORDER, REJECT_TEXT = '#E08173', '#F5B0A6'
 PLAYHEAD = '#FF8A5C'
 CONTROL_BG = '#17323E'
 CONTROL_HOVER = '#20525C'
+MENU_DISABLED_TEXT = '#69848D'
 # Timeline blocks, one colour per track, different in lightness as well as hue.
 TRACK_COLOURS = dict(dialogue=('#5D4FC4', '#FFFFFF', None), vocal=('#E7B3DD', '#2A0F25', None),
                      effect=('#1C7F7A', '#FFFFFF', None), uncertain=(None, '#D5E6EB', '#9FB8C1'))
@@ -139,7 +142,13 @@ QHeaderView::section {{ background: {COLUMN_HEADER_BG}; color: {TEXT_MUTED}; fon
     border-bottom: 1px solid {BORDER_STRONG}; }}
 QTableWidget, QTableView, QListView, QTreeView {{ background: {PANEL_BG}; }}
 QTableWidget::item:selected, QTableView::item:selected {{ background: {SELECTED_ROW}; color: #ffffff; }}
-QMenu {{ font-size: {TEXT_CONTENT}px; }}
+QMenu {{ background: {APP_BG}; color: {TEXT_MAIN}; font-size: {TEXT_CONTENT}px;
+    border: 1px solid {BORDER_STRONG}; padding: 4px; }}
+QMenu::item {{ background: transparent; color: {TEXT_MAIN}; padding: 6px 24px;
+    border: 1px solid transparent; border-radius: {RADIUS}px; }}
+QMenu::item:selected:enabled {{ background: {SELECTED_ROW}; color: {TEXT_MAIN}; border-color: {ACCENT}; }}
+QMenu::item:disabled {{ background: transparent; color: {MENU_DISABLED_TEXT}; border-color: transparent; }}
+QMenu::separator {{ height: 1px; background: {BORDER_ROW}; margin: 4px 8px; }}
 QToolTip {{ font-size: {TEXT_SECONDARY + 1}px; }}
 QCheckBox {{ font-size: {TEXT_CONTENT}px; }}
 """

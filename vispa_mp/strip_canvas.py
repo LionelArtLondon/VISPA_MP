@@ -1,12 +1,11 @@
 """A fixed arrangement of review cards, viewed like a physical board."""
 
-from functools import lru_cache
-
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QPainter, QPixmap, QTransform
 from PySide6.QtWidgets import QGraphicsScene, QGraphicsView, QWidget
 
 from vispa_mp.preview import draw_preview, frame_ratio
+from vispa_mp.preview_quality import PixmapCache, normalized_quality
 from vispa_mp.ui_tokens import PANEL_BG
 
 
@@ -24,17 +23,35 @@ def balanced_columns(count, width, height, card_width=204, card_height=168, gap=
     return max(complete or candidates)[2]
 
 
-@lru_cache(maxsize=96)
+_sources = PixmapCache()
+
+
 def _source_pixmap(path):
-    return QPixmap(path) if path else QPixmap()
+    if not path:
+        return QPixmap()
+    cached = _sources.get(path)
+    return cached if cached is not None else _sources.put(path, QPixmap(path))
 
 
 class CanvasImage(QWidget):
     """Paint the source still at the view's resolution, including while zoomed."""
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.preview_quality = "Medium"
+        self._source_path = ""
+
+    @property
+    def picture(self):
+        return _source_pixmap(getattr(self, "_source_path", ""))
+
     def set_source(self, path, fallback):
-        self.picture = _source_pixmap(path)
+        self._source_path = path
         self.fallback = QColor(fallback)
+        self.update()
+
+    def set_preview_quality(self, quality):
+        self.preview_quality = normalized_quality(quality)
         self.update()
 
     def set_frame_format(self, format_name, custom_width=16, custom_height=9):
@@ -44,10 +61,11 @@ class CanvasImage(QWidget):
 
     def paintEvent(self, _event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        quality = getattr(self, "preview_quality", "Medium")
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, quality != "Low")
         picture = getattr(self, "picture", None)
         draw_preview(painter, picture, self.rect(), getattr(self, "fallback", QColor(PANEL_BG)),
-                     crop=getattr(self, "frame_ratio", None) is not None)
+                     crop=getattr(self, "frame_ratio", None) is not None, quality=quality)
 
 
 class StripCanvasView(QGraphicsView):
@@ -62,16 +80,34 @@ class StripCanvasView(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.preview_quality = "Medium"
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self._canvas = None
         self._content = QRectF()
 
+    def set_preview_quality(self, quality):
+        self.preview_quality = normalized_quality(quality)
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, self.preview_quality != "Low")
+        if self._canvas is not None:
+            for picture in self._canvas.findChildren(CanvasImage):
+                picture.set_preview_quality(self.preview_quality)
+        self.viewport().update()
+
     def setWidget(self, widget):
         self._canvas = widget
         self._proxy = self.scene().addWidget(widget)
+        self.set_preview_quality(getattr(self, "preview_quality", "Medium"))
 
     def widget(self):
         return self._canvas
+
+    def scrollContentsBy(self, dx, dy):
+        super().scrollContentsBy(dx, dy)
+        # QGraphicsView scrolls viewport child widgets too; keep HUDs fixed.
+        for widget in self.viewport().children():
+            if isinstance(widget, QWidget) and widget.property("canvasOverlay"):
+                widget.move(10, 10)
+                widget.raise_()
 
     def set_content_size(self, width, height):
         content = QRectF(0, 0, width, height)

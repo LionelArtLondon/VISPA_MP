@@ -360,16 +360,6 @@ end
 
 local function cue_warning(names)
   if #names == 0 then return "Video 1 was not found." end
-  local cue = {}
-  for index, name in ipairs(names) do
-    if trim(name):lower() == "cue_source" then cue[#cue + 1] = tostring(index) end
-  end
-  if #cue == 0 then
-    return "No track is named CUE_SOURCE. Analysis uses video 1. The Cue exporter looks for a track with that name."
-  end
-  if not (#cue == 1 and cue[1] == "1") then
-    return "CUE_SOURCE is not video 1 (track " .. table.concat(cue, ", ") .. "). Analysis stays on video 1."
-  end
   return ""
 end
 
@@ -534,10 +524,122 @@ local function timeline_name()
   return ""
 end
 
+local function learning_error(text) error("Learning import: " .. text, 0) end
+
+local function library_database(manager)
+  local db = call(manager, "GetCurrentDatabase")
+  if type(db) ~= "table" or not db.DbName then learning_error("the connected project library could not be identified.") end
+  return { DbType = tostring(db.DbType or ""), DbName = tostring(db.DbName or ""), IpAddress = tostring(db.IpAddress or "") }
+end
+
+local function library_names(values)
+  if type(values) ~= "table" then learning_error("the library names could not be read.") end
+  local found = {}
+  for key, name in pairs(values) do
+    -- Resolve's Lua lists also carry numeric __flags bookkeeping, including
+    -- lists with no names. It is metadata, as in each_item(), above.
+    if key ~= "__flags" then
+      if type(name) ~= "string" or name == "" or #name > 2048 then learning_error("an invalid library name was returned.") end
+      found[#found + 1] = name
+    end
+  end
+  table.sort(found)
+  return found
+end
+
+local function library_goto(manager, path)
+  if not call(manager, "GotoRootFolder") then learning_error("the project library root could not be opened.") end
+  for _, folder in ipairs(path) do
+    if not call(manager, "OpenFolder", folder) then learning_error("the project folder could not be opened: " .. folder) end
+  end
+end
+
+local function learning_library()
+  local manager = call(resolve, "GetProjectManager")
+  local db = library_database(manager)
+  local reversed, origin = {}, {}
+  local at_root = false
+  for _ = 1, 32 do
+    local name = call(manager, "GetCurrentFolder")
+    if not call(manager, "GotoParentFolder") then at_root = true; break end
+    if type(name) ~= "string" then learning_error("the current project folder could not be identified.") end
+    reversed[#reversed + 1] = name
+  end
+  if not at_root then learning_error("the project library has too many nested folders.") end
+  for index = #reversed, 1, -1 do origin[#origin + 1] = reversed[index] end
+  local entries, visited = {}, 0
+  local function visit(path)
+    visited = visited + 1
+    if #path > 12 or visited > 1000 then learning_error("the project library is too large for one scan.") end
+    for _, name in ipairs(library_names(call(manager, "GetProjectListInCurrentFolder"))) do
+      local copied = array({})
+      for _, part in ipairs(path) do copied[#copied + 1] = part end
+      entries[#entries + 1] = { name = name, folder = copied, database = db }
+      if #entries > 2000 then learning_error("the project library has more than 2000 projects.") end
+    end
+    for _, folder in ipairs(library_names(call(manager, "GetFolderListInCurrentFolder"))) do
+      if not call(manager, "OpenFolder", folder) then learning_error("a project folder could not be opened.") end
+      local child = {}
+      for _, part in ipairs(path) do child[#child + 1] = part end
+      child[#child + 1] = folder
+      visit(child)
+      if not call(manager, "GotoParentFolder") then learning_error("the project folder could not be restored.") end
+    end
+  end
+  local ok, failure = pcall(function() library_goto(manager, {}); visit({}) end)
+  library_goto(manager, origin)
+  if not ok then error(failure, 0) end
+  return { database = db, projects = array(entries) }
+end
+
+local function learning_open(command)
+  local entry, expected = command.entry, command.timeline_name or ""
+  if type(entry) ~= "table" or type(entry.name) ~= "string" or entry.name == ""
+      or type(entry.folder) ~= "table" or #entry.folder > 12 or type(expected) ~= "string" then
+    learning_error("the selected project or timeline is invalid.")
+  end
+  for _, part in ipairs(entry.folder) do
+    if type(part) ~= "string" or part == "" then learning_error("the selected project folder is invalid.") end
+  end
+  local manager = call(resolve, "GetProjectManager")
+  local db, wanted = library_database(manager), entry.database
+  if type(wanted) ~= "table" or db.DbType ~= wanted.DbType or db.DbName ~= wanted.DbName or db.IpAddress ~= wanted.IpAddress then
+    learning_error("the active project library changed. Refresh the batch list.")
+  end
+  library_goto(manager, entry.folder)
+  local exists = false
+  for _, name in ipairs(library_names(call(manager, "GetProjectListInCurrentFolder"))) do if name == entry.name then exists = true end end
+  if not exists then learning_error("the selected project is no longer in its folder: " .. entry.name) end
+  local opened = call(manager, "LoadProject", entry.name)
+  if not opened then learning_error("Resolve did not open " .. entry.name .. ". Save any current Resolve work and retry; no project is force-closed.") end
+  local current = call(manager, "GetCurrentProject")
+  local project_id = call(opened, "GetUniqueId")
+  if not project_id or call(current, "GetUniqueId") ~= project_id or call(opened, "GetName") ~= entry.name then
+    learning_error("Resolve did not confirm the requested project as current.")
+  end
+  local matches, count = {}, tonumber(call(opened, "GetTimelineCount")) or 0
+  for index = 1, count do
+    local item = call(opened, "GetTimelineByIndex", index)
+    if item and (call(item, "GetName") == expected or (expected == "" and count == 1)) then matches[#matches + 1] = item end
+  end
+  if #matches ~= 1 then learning_error("project " .. entry.name .. " needs exactly one matching timeline: " .. expected) end
+  local selected = matches[1]
+  if not call(opened, "SetCurrentTimeline", selected) then learning_error("the requested learning timeline could not be activated.") end
+  local actual = call(opened, "GetCurrentTimeline")
+  local identity = timeline_identity(selected, opened)
+  local verified = timeline_identity(actual, current)
+  if not identity or not verified or identity.project_id ~= verified.project_id or identity.timeline_id ~= verified.timeline_id then
+    learning_error("Resolve did not confirm the requested timeline identity.")
+  end
+  return read_timeline(selected, opened)
+end
+
 local function dispatch(command, timeline, project)
   local name = command.cmd
   if name == "ping" then return { ok = true } end
   if name == "stop" then return { ok = true, stopping = true } end
+  if name == "learning_library" then return learning_library() end
+  if name == "learning_open" then return learning_open(command) end
   if name == "read" then return read_timeline(timeline, project) end
   if name == "seek" then
     local ok = call(timeline, "SetCurrentTimecode", command.timecode)
@@ -621,7 +723,9 @@ local function handle_once()
   if is_stale(request, os.time()) then return false end
   local ran, result = pcall(function()
     local timeline, project = nil, nil
-    if request.cmd ~= "ping" and request.cmd ~= "stop" then timeline, project = current_timeline() end
+    if request.cmd ~= "ping" and request.cmd ~= "stop" and request.cmd ~= "learning_library" and request.cmd ~= "learning_open" then
+      timeline, project = current_timeline()
+    end
     return dispatch(request, timeline, project)
   end)
   local response
@@ -657,6 +761,8 @@ local function self_check()
   assert(absolute_mark(100, 86400) == 86500)
   assert(absolute_mark(86500, 86400) == 86500)
   assert(cue_warning({ "CUE_SOURCE" }) == "")
+  assert(cue_warning({ "Animation" }) == "")
+  assert(cue_warning({ "Animation", "CUE_SOURCE" }) == "")
   assert(cue_warning({}) == "Video 1 was not found.")
   local delete, add, skipped = plan_apply(
     { { frame = 1, automatic = false }, { frame = 2, automatic = true } },

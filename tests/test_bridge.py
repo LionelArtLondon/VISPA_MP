@@ -140,8 +140,27 @@ def test_only_video_1_and_audio_1_are_read_and_hand_markers_stay():
     assert snapshot["mark_in"] == 86500
     assert snapshot["markers"][0]["automatic"] is False
     assert snapshot["markers"][1]["automatic"] is True
-    assert "CUE_SOURCE" in snapshot["warnings"][0]
+    assert snapshot["warnings"] == []
     assert cue_warning(["CUE_SOURCE"]) == ""
+
+
+def test_a_cue_track_elsewhere_does_not_warn_or_change_the_video_source():
+    timeline = Timeline()
+    timeline.GetTrackName = lambda kind, index: "CUE_SOURCE" if kind == "video" and index == 2 else "Source"
+    snapshot = read_timeline(timeline)
+    assert snapshot["video_track_name"] == "Source"
+    assert [clip["path"] for clip in snapshot["video_clips"]] == ["episode.mp4"]
+    assert snapshot["warnings"] == []
+
+
+def test_missing_video_and_audio_warnings_are_kept():
+    timeline = Timeline()
+    timeline.GetTrackCount = lambda _kind: 0
+    timeline.GetItemListInTrack = lambda _kind, _index: []
+    warnings = read_timeline(timeline)["warnings"]
+    assert "Video 1 was not found." in warnings
+    assert "Video 1 has no clip linked to a file." in warnings
+    assert "Audio 1 has no clip linked to a file. Lines will not be detected." in warnings
 
 
 def test_read_without_project_name_keeps_the_timeline_readable():

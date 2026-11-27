@@ -101,7 +101,7 @@ def test_reading_another_timeline_clears_the_previous_review(qapp, tmp_path, mon
     assert window.pages == []
     assert window._preview is None
     assert window._suggestions_open is False
-    assert window.timeline_label.text() == "Other episode"
+    assert window.timeline_label.text() == "Project: unknown\nTimeline: Other episode"
 
 
 def test_reading_the_same_unchanged_timeline_preserves_review_choices(qapp, tmp_path, monkeypatch):

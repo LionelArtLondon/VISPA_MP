@@ -107,8 +107,13 @@ def test_changing_page_moves_only_the_playhead(qapp):
     assert window.playhead_frame == kept_head
     assert window.stack.currentIndex() == 1
     assert window.apply_button.text() == "Place markers"
-    assert window.read_button.text() == "Read timeline"
-    assert window.analyze_button.text() == "Analyze"
+    assert window.read_button.text() == window.analyze_button.text() == ""
+    assert window.read_button.accessibleName() == "Read timeline"
+    assert window.analyze_button.accessibleName() == "Analyze"
+    assert not window.read_button.icon().isNull()
+    assert not window.analyze_button.icon().isNull()
+    assert "Import the current timeline from Resolve" in window.read_button.toolTip()
+    assert "propose markers" in window.analyze_button.toolTip()
     window.strip_button.click()
     assert window.mode == "strip"
     assert window.open_pages == kept_open
@@ -190,6 +195,40 @@ def test_warnings_of_one_kind_are_told_once(qapp):
         "3 pages have fewer images than the minimum (Settings › Pages › Images per page).",
         "Line at frame 5 has no examined image.",
     ]
+
+
+def test_old_cue_notices_are_hidden_without_losing_source_or_timing_warnings(qapp):
+    from copy import deepcopy
+    from vispa_mp.snapshot import OLD_SCRIPT
+
+    window = MainWindow(client=None)
+    window.snapshot = {"warnings": [
+        "No track is named CUE_SOURCE.",
+        "No track is named CUE_SOURCE. Analysis uses video 1. The Cue exporter looks for a track with that name.",
+    ]}
+    window.analysis = {"warnings": ["CUE_SOURCE is not video 1 (track 2, 3). Analysis stays on video 1."]}
+    original = deepcopy((window.snapshot, window.analysis))
+    window._show_warnings()
+    assert window.warnings.text() == ""
+    assert window.warnings.isHidden()
+    assert window.warnings.toolTip() == ""
+    assert (window.snapshot, window.analysis) == original
+
+    important = ["Video 1 was not found.", "Video 1 has no clip linked to a file.",
+                 "Audio 1 has no clip linked to a file. Lines will not be detected.",
+                 "Video 1 runs at 25 fps and the timeline at 24: Resolve repeats or skips pictures.",
+                 OLD_SCRIPT, "The clip on CUE_SOURCE is offline."]
+    window.snapshot["warnings"].extend(important)
+    window._show_warnings()
+    assert window.warnings.text().splitlines() == important
+    assert window.warnings.toolTip().splitlines() == important
+    assert window.warnings.isHidden()
+    window._show_review_report()
+    qapp.processEvents()
+    assert window.warnings.isVisible()
+    assert window.warnings.text().splitlines() == important
+    window.review_report_dialog.close()
+    assert window.warnings.isHidden()
 
 
 def test_a_page_shows_all_its_images_and_the_board_draws_them(qapp):

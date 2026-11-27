@@ -106,7 +106,7 @@ def test_hiding_labels_keeps_board_borders_and_marker_payload_unchanged(qapp, tm
     assert with_labels.pixelColor(11, 60) == without_labels.pixelColor(11, 60)
     assert without_labels.pixelColor(11, 60) != QColor("yellow")
     # The large role badge disappears, while the image and perimeter remain.
-    badge_area = QRect(16, 16, 48, 18)
+    badge_area = QRect(20, 20, 40, 14)
     labelled = sum(with_labels.pixelColor(x, y) == color
                    for y in range(badge_area.top(), badge_area.bottom())
                    for x in range(badge_area.left(), badge_area.right()))

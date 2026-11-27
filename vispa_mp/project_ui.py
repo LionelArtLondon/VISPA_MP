@@ -11,6 +11,7 @@ from vispa_mp.client import open_client
 from vispa_mp.preset import PREVIEW_DEFAULTS, load
 from vispa_mp.project import FILE_FILTER as PROJECT_FILTER, load_project, save_project
 from vispa_mp.project_location import get_project_folder, set_project_folder
+from vispa_mp.recent_projects import clear_recent, load_recent, remember_project
 from vispa_mp.resolve_link import link_running
 from vispa_mp.snapshot import describe_rate, normalize
 from vispa_mp.timeline_identity import normalize_identity
@@ -53,6 +54,7 @@ class ProjectReviewMixin:
 
     def _build_project_button(self):
         self.project_button = QToolButton()
+        self.project_button.setObjectName("projectButton")
         self.project_button.setText("Project")
         self.project_button.setAccessibleName("Project")
         self.project_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
@@ -69,11 +71,66 @@ class ProjectReviewMixin:
             self.addAction(action)
             self.project_menu.addAction(action)
             setattr(self, name, action)
+        self.recent_projects_menu = QMenu("Open Recent Project", self.project_menu)
+        self.project_menu.insertMenu(self.save_project_action, self.recent_projects_menu)
+        self.recent_projects_menu.setToolTipsVisible(True)
+        self.recent_projects_menu.aboutToShow.connect(self._refresh_recent_projects_menu)
+        self._refresh_recent_projects_menu()
         self.project_menu.addSeparator()
         self.project_folder_action = self.project_menu.addAction("DaVinci project folder…")
         self.project_folder_action.triggered.connect(lambda _checked=False: self._choose_project_folder())
         self.project_button.setMenu(self.project_menu)
         return self.project_button
+
+    def _refresh_recent_projects_menu(self):
+        self.recent_projects_menu.clear()
+        paths = load_recent()
+        idle = self.worker is None and not getattr(self, "_learning_job_busy", False)
+        names = [Path(path).name.casefold() for path in paths]
+        if not paths:
+            self.recent_projects_menu.addAction("No recent projects").setEnabled(False)
+        for value in paths:
+            path = Path(value)
+            name = path.name
+            if names.count(name.casefold()) > 1:
+                name += f" — {path.parent}"
+            try:
+                available = path.is_file()
+            except OSError:
+                available = False
+            if not available:
+                name += " (missing)"
+            action = self.recent_projects_menu.addAction(name.replace("&", "&&"))
+            action.setData(value)
+            action.setToolTip(value)
+            action.setEnabled(idle and available)
+            action.triggered.connect(lambda _checked=False, path=value: self._open_recent_project(path))
+        self.recent_projects_menu.addSeparator()
+        self.clear_recent_projects_action = self.recent_projects_menu.addAction("Clear recent projects")
+        self.clear_recent_projects_action.setEnabled(idle and bool(paths))
+        self.clear_recent_projects_action.triggered.connect(self._clear_recent_projects)
+        self.recent_projects_menu.setEnabled(idle)
+
+    def _open_recent_project(self, path):
+        if self.worker is None and not getattr(self, "_learning_job_busy", False):
+            self.open_project_file(path)
+
+    def _remember_recent_project(self, path):
+        try:
+            remember_project(path)
+        except (OSError, ValueError):
+            return False
+        return True
+
+    def _clear_recent_projects(self):
+        if self.worker is not None or getattr(self, "_learning_job_busy", False):
+            return
+        try:
+            clear_recent()
+        except OSError as error:
+            self._project_message.tell(self, "Recent projects", "The recent-project list could not be cleared.", str(error))
+            return
+        self._refresh_recent_projects_menu()
 
     def _mark_project_dirty(self):
         if self._ready and self.analysis is not None and not self._restoring_project:
@@ -82,11 +139,15 @@ class ProjectReviewMixin:
 
     def _set_review_busy(self, busy):
         for name in ("project_button", "read_button", "apply_button", "settings_button", "settings_dialog",
-                     "pages_panel", "review_center", "review_adjust", "strip_button", "board_button"):
+                     "pages_panel", "review_center", "review_adjust", "strip_button", "board_button", "suggestion_panel"):
             getattr(self, name).setEnabled(not busy)
         for action in (self.open_project_action, self.save_project_action, self.save_project_as_action):
             action.setEnabled(not busy)
+        self.recent_projects_menu.setEnabled(not busy)
+        if hasattr(self, "learning_button"):
+            self.learning_button.setEnabled(not busy)
         self.analyze_button.setEnabled(not busy)
+        self._sync_review_history_actions()
 
     def _sync_project_title(self):
         caption = "VISPA MP"
@@ -112,8 +173,12 @@ class ProjectReviewMixin:
             **{key: getattr(self, key, default) for key, default in PREVIEW_DEFAULTS.items()},
             "excluded_frames": sorted(getattr(self, "_excluded_frames", set())),
             "page_layout": deepcopy(getattr(self, "_page_layout", None)),
+            "learning_profile": self._project_learning_profile() if hasattr(self, "_project_learning_profile") else None,
             "mode": self.mode, "view_filter": self.view_filter,
             "suggestions_height": self.get_suggestions_height(),
+            "suggestions_auto_open": getattr(self, "suggestions_auto_open", False),
+            "suggestions_detached": getattr(self, "suggestions_detached", False),
+            "suggestions_rows": getattr(self, "suggestions_rows", 0),
             "cameras": self.get_review_cameras(),
             "selected_frame": self.selected_frame, "selected_manual": self.selected_manual,
             "selected_page_id": self.selected_page_id, "playhead_frame": self.playhead_frame,
@@ -181,7 +246,9 @@ class ProjectReviewMixin:
         self.project_path = Path(path)
         self._project_dirty = False
         self._sync_project_title()
-        self.status.setText(f"Project saved: {self.project_path.name}. Markers in Resolve were not changed.")
+        recent = self._remember_recent_project(self.project_path)
+        self.status.setText(f"Project saved: {self.project_path.name}. Markers in Resolve were not changed."
+                            + ("" if recent else " The recent-project list could not be saved."))
         return True
 
     def _confirm_project_discard(self):
@@ -252,6 +319,8 @@ class ProjectReviewMixin:
                 self._project_message.tell(self, "Open project", "This VISPA MP project cannot be opened.", str(error))
                 return
             self._restore_project(result["project"], result["snapshot"], result["client"], path)
+            if not self._remember_recent_project(path):
+                self.status.setText(self.status.text() + " The recent-project list could not be saved.")
 
         self._start(work, done)
 
@@ -278,6 +347,12 @@ class ProjectReviewMixin:
         self._ready = False
         try:
             self._stored_settings = {**load(), **project["settings"]}
+            # New density defaults must not change an older saved preparation
+            # the next time its user adjusts an unrelated setting.
+            if "global_markers_enabled" not in project["settings"]:
+                self._stored_settings["global_markers_enabled"] = False
+                if "compression" not in project["settings"]:
+                    self._stored_settings["compression"] = 0.35
             for key, value in self._stored_settings.items():
                 if key in self.widgets:
                     self.set_setting(key, value)
@@ -301,6 +376,8 @@ class ProjectReviewMixin:
             self.proposals = deepcopy(project["proposals"])
             self._excluded_frames = set(view.get("excluded_frames") or [])
             self._page_layout = deepcopy(view.get("page_layout"))
+            if hasattr(self, "_restore_learning_profile"):
+                self._restore_learning_profile(view.get("learning_profile"))
             self.rule_warnings = list(view.get("rule_warnings") or [])
             self._preview = None
             self._suggestions_open = False
@@ -308,6 +385,7 @@ class ProjectReviewMixin:
             self.open_pages = set(view.get("open_pages") or [])
             self.selected_frame = view.get("selected_frame")
             self.selected_manual = bool(view.get("selected_manual"))
+            self._select_single_frame(self.selected_frame, self.selected_manual)
             self.selected_page_id = view.get("selected_page_id")
             self._sync_preview_fields()
             self._fill()
@@ -315,11 +393,14 @@ class ProjectReviewMixin:
             if view.get("playhead_frame") is not None:
                 self._move_playhead(view["playhead_frame"])
             self.set_review_cameras(view.get("cameras"))
+            if hasattr(self, "_restore_suggestions_preferences"):
+                self._restore_suggestions_preferences(view)
             self.tracks_label.setText(f"{describe_rate(snapshot)} · Video 1 · Audio 1")
             self._sync_resolve()
             self.project_path = Path(path)
             self._project_dirty = False
             self._sync_project_title()
+            self._clear_review_history()
         finally:
             self._ready = True
             self._restoring_project = False

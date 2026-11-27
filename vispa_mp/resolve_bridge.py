@@ -272,10 +272,17 @@ def apply_markers(timeline, proposals, start=None, end=None, expected_timeline=N
             "outside": outside, "verified": True, "requested": len(proposals), "attempted": len(add)}
 
 
-def dispatch(command, timeline, project=None):
+def dispatch(command, timeline, project=None, resolve=None):
     name = command.get("cmd")
     if name == "ping":
         return {"ok": True}
+    if name == "learning_library":
+        from vispa_mp.resolve_library import list_learning_projects
+        return list_learning_projects(resolve)
+    if name == "learning_open":
+        from vispa_mp.resolve_library import open_learning_timeline
+        selected, opened = open_learning_timeline(resolve, command.get("entry"), command.get("timeline_name", ""))
+        return read_timeline(selected, opened)
     if name == "read":
         return read_timeline(timeline, project)
     if name == "seek":
@@ -297,12 +304,12 @@ def serve(resolve):
         message = json.loads(line)
         try:
             timeline = project = None
-            if message.get("cmd") != "ping":
+            if message.get("cmd") not in ("ping", "learning_library", "learning_open"):
                 project = resolve.GetProjectManager().GetCurrentProject()
                 if not project:
                     raise RuntimeError("No project is open.")
                 timeline = project.GetCurrentTimeline()
-            result = dispatch(message, timeline, project)
+            result = dispatch(message, timeline, project, resolve=resolve)
             payload = {"id": message.get("id"), "ok": True, "result": result}
         except Exception as error:
             payload = {"id": message.get("id"), "ok": False, "error": str(error)}

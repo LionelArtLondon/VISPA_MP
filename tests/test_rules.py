@@ -27,7 +27,7 @@ def analysis(shots, **overrides):
 
 
 def settings(**overrides):
-    data = dict(DEFAULTS)
+    data = dict(DEFAULTS, global_markers_enabled=False)
     data.update(overrides)
     return data
 

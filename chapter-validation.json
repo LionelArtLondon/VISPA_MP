@@ -1,0 +1,299 @@
+{
+  "kind": "vispa-mp-cross-validation",
+  "version": 1,
+  "method": "leave_one_group_out",
+  "metric": "pairwise_preference_accuracy",
+  "baseline": "standard_visual_weights_v1",
+  "aggregation": "macro_by_group",
+  "reference_count": 6,
+  "sample_count": 47761,
+  "groups": [
+    "TOME_04_CHAPITRE04_MP_REF",
+    "media-189e261260a50e8471d3b711",
+    "media-37e70b66fcf07e4bb49e3d13",
+    "media-4c939cec4de3a565a638f59b",
+    "media-7186148c3ffe78a045689b62",
+    "media-7820d7b27e07e56da1e19c38"
+  ],
+  "fold_count": 6,
+  "group_names": {
+    "TOME_04_CHAPITRE04_MP_REF": [
+      "TOME_04_CHAPITRE_MP_REF"
+    ],
+    "media-189e261260a50e8471d3b711": [
+      "TOME_05_Chapt_02_MP_REF"
+    ],
+    "media-37e70b66fcf07e4bb49e3d13": [
+      "TOME_04_CHAPITRE_03_MP_REF"
+    ],
+    "media-4c939cec4de3a565a638f59b": [
+      "TOME_05_Chapt_04_MP_REF"
+    ],
+    "media-7186148c3ffe78a045689b62": [
+      "TOME_05_Chapt_03_MP_REF"
+    ],
+    "media-7820d7b27e07e56da1e19c38": [
+      "TOME_05_Chapt_01_MP_REF"
+    ]
+  },
+  "folds": [
+    {
+      "heldout_group": "TOME_04_CHAPITRE04_MP_REF",
+      "train_groups": [
+        "media-189e261260a50e8471d3b711",
+        "media-37e70b66fcf07e4bb49e3d13",
+        "media-4c939cec4de3a565a638f59b",
+        "media-7186148c3ffe78a045689b62",
+        "media-7820d7b27e07e56da1e19c38"
+      ],
+      "roles": {
+        "core": {
+          "trained": true,
+          "train_pairs": 20000,
+          "validation_pairs": 4000,
+          "baseline_accuracy": 0.529,
+          "personal_accuracy": 0.5405,
+          "reason": null
+        },
+        "extra": {
+          "trained": true,
+          "train_pairs": 6629,
+          "validation_pairs": 1324,
+          "baseline_accuracy": 0.41842900302114805,
+          "personal_accuracy": 0.4916918429003021,
+          "reason": null
+        },
+        "page": {
+          "trained": true,
+          "train_pairs": 4576,
+          "validation_pairs": 768,
+          "baseline_accuracy": 0.4583333333333333,
+          "personal_accuracy": 0.57421875,
+          "reason": null
+        }
+      }
+    },
+    {
+      "heldout_group": "media-189e261260a50e8471d3b711",
+      "train_groups": [
+        "TOME_04_CHAPITRE04_MP_REF",
+        "media-37e70b66fcf07e4bb49e3d13",
+        "media-4c939cec4de3a565a638f59b",
+        "media-7186148c3ffe78a045689b62",
+        "media-7820d7b27e07e56da1e19c38"
+      ],
+      "roles": {
+        "core": {
+          "trained": true,
+          "train_pairs": 20000,
+          "validation_pairs": 4000,
+          "baseline_accuracy": 0.54475,
+          "personal_accuracy": 0.56375,
+          "reason": null
+        },
+        "extra": {
+          "trained": true,
+          "train_pairs": 5827,
+          "validation_pairs": 2126,
+          "baseline_accuracy": 0.4435559736594544,
+          "personal_accuracy": 0.4835371589840075,
+          "reason": null
+        },
+        "page": {
+          "trained": true,
+          "train_pairs": 4528,
+          "validation_pairs": 816,
+          "baseline_accuracy": 0.4681372549019608,
+          "personal_accuracy": 0.5723039215686274,
+          "reason": null
+        }
+      }
+    },
+    {
+      "heldout_group": "media-37e70b66fcf07e4bb49e3d13",
+      "train_groups": [
+        "TOME_04_CHAPITRE04_MP_REF",
+        "media-189e261260a50e8471d3b711",
+        "media-4c939cec4de3a565a638f59b",
+        "media-7186148c3ffe78a045689b62",
+        "media-7820d7b27e07e56da1e19c38"
+      ],
+      "roles": {
+        "core": {
+          "trained": true,
+          "train_pairs": 20000,
+          "validation_pairs": 4000,
+          "baseline_accuracy": 0.54575,
+          "personal_accuracy": 0.56425,
+          "reason": null
+        },
+        "extra": {
+          "trained": true,
+          "train_pairs": 7635,
+          "validation_pairs": 318,
+          "baseline_accuracy": 0.44654088050314467,
+          "personal_accuracy": 0.5628930817610063,
+          "reason": null
+        },
+        "page": {
+          "trained": true,
+          "train_pairs": 4400,
+          "validation_pairs": 944,
+          "baseline_accuracy": 0.5540254237288136,
+          "personal_accuracy": 0.5338983050847458,
+          "reason": null
+        }
+      }
+    },
+    {
+      "heldout_group": "media-4c939cec4de3a565a638f59b",
+      "train_groups": [
+        "TOME_04_CHAPITRE04_MP_REF",
+        "media-189e261260a50e8471d3b711",
+        "media-37e70b66fcf07e4bb49e3d13",
+        "media-7186148c3ffe78a045689b62",
+        "media-7820d7b27e07e56da1e19c38"
+      ],
+      "roles": {
+        "core": {
+          "trained": true,
+          "train_pairs": 20000,
+          "validation_pairs": 4000,
+          "baseline_accuracy": 0.52025,
+          "personal_accuracy": 0.53325,
+          "reason": null
+        },
+        "extra": {
+          "trained": true,
+          "train_pairs": 6872,
+          "validation_pairs": 1081,
+          "baseline_accuracy": 0.5106382978723404,
+          "personal_accuracy": 0.5642923219241444,
+          "reason": null
+        },
+        "page": {
+          "trained": true,
+          "train_pairs": 4576,
+          "validation_pairs": 768,
+          "baseline_accuracy": 0.51953125,
+          "personal_accuracy": 0.6184895833333334,
+          "reason": null
+        }
+      }
+    },
+    {
+      "heldout_group": "media-7186148c3ffe78a045689b62",
+      "train_groups": [
+        "TOME_04_CHAPITRE04_MP_REF",
+        "media-189e261260a50e8471d3b711",
+        "media-37e70b66fcf07e4bb49e3d13",
+        "media-4c939cec4de3a565a638f59b",
+        "media-7820d7b27e07e56da1e19c38"
+      ],
+      "roles": {
+        "core": {
+          "trained": true,
+          "train_pairs": 20000,
+          "validation_pairs": 4000,
+          "baseline_accuracy": 0.54375,
+          "personal_accuracy": 0.56325,
+          "reason": null
+        },
+        "extra": {
+          "trained": true,
+          "train_pairs": 6005,
+          "validation_pairs": 1948,
+          "baseline_accuracy": 0.3973305954825462,
+          "personal_accuracy": 0.48767967145790553,
+          "reason": null
+        },
+        "page": {
+          "trained": true,
+          "train_pairs": 4480,
+          "validation_pairs": 864,
+          "baseline_accuracy": 0.5173611111111112,
+          "personal_accuracy": 0.5729166666666666,
+          "reason": null
+        }
+      }
+    },
+    {
+      "heldout_group": "media-7820d7b27e07e56da1e19c38",
+      "train_groups": [
+        "TOME_04_CHAPITRE04_MP_REF",
+        "media-189e261260a50e8471d3b711",
+        "media-37e70b66fcf07e4bb49e3d13",
+        "media-4c939cec4de3a565a638f59b",
+        "media-7186148c3ffe78a045689b62"
+      ],
+      "roles": {
+        "core": {
+          "trained": true,
+          "train_pairs": 20000,
+          "validation_pairs": 4000,
+          "baseline_accuracy": 0.52625,
+          "personal_accuracy": 0.54725,
+          "reason": null
+        },
+        "extra": {
+          "trained": true,
+          "train_pairs": 6797,
+          "validation_pairs": 1156,
+          "baseline_accuracy": 0.551038062283737,
+          "personal_accuracy": 0.592560553633218,
+          "reason": null
+        },
+        "page": {
+          "trained": true,
+          "train_pairs": 4160,
+          "validation_pairs": 1184,
+          "baseline_accuracy": 0.5008445945945946,
+          "personal_accuracy": 0.5489864864864865,
+          "reason": null
+        }
+      }
+    }
+  ],
+  "roles": {
+    "core": {
+      "baseline_accuracy": 0.5349583333333333,
+      "personal_accuracy": 0.5520416666666667,
+      "delta": 0.01708333333333334,
+      "groups_evaluated": 6,
+      "groups_total": 6,
+      "groups_skipped": 0,
+      "validation_pairs": 24000,
+      "groups_improved": 6,
+      "groups_regressed": 0,
+      "groups_unchanged": 0
+    },
+    "extra": {
+      "baseline_accuracy": 0.4612554688037284,
+      "personal_accuracy": 0.5304424384434306,
+      "delta": 0.06918696963970222,
+      "groups_evaluated": 6,
+      "groups_total": 6,
+      "groups_skipped": 0,
+      "validation_pairs": 7953,
+      "groups_improved": 6,
+      "groups_regressed": 0,
+      "groups_unchanged": 0
+    },
+    "page": {
+      "baseline_accuracy": 0.5030388279449689,
+      "personal_accuracy": 0.5701356188566433,
+      "delta": 0.06709679091167442,
+      "groups_evaluated": 6,
+      "groups_total": 6,
+      "groups_skipped": 0,
+      "validation_pairs": 5344,
+      "groups_improved": 5,
+      "groups_regressed": 1,
+      "groups_unchanged": 0
+    }
+  },
+  "warnings": [
+    "These scores compare weak image preferences against fixed visual weights. They do not measure final page quality or the complete marker pipeline."
+  ],
+  "validation_unavailable": false
+}

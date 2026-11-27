@@ -7,4 +7,5 @@ tools/
 *.pyc
 presets/user.json
 presets/project_locations.json
+presets/recent-projects.json
 presets/saved/

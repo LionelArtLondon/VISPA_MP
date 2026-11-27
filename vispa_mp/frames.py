@@ -23,9 +23,6 @@ def ffmpeg_path():
         os.environ.get("VISPA_MP_FFMPEG"),
         os.environ.get("FFMPEG"),
         str(ROOT / "tools" / "ffmpeg" / "ffmpeg.exe"),
-        shutil.which("ffmpeg"),
-        r"C:\Program Files\Topaz Labs LLC\Topaz Video AI\ffmpeg.exe",
-        r"C:\Program Files\EaseUS\EaseUS Data Recovery Wizard\VideoViewer\ffmpeg.exe",
     ]
     for candidate in candidates:
         if candidate and Path(candidate).is_file():
@@ -33,6 +30,11 @@ def ffmpeg_path():
     found = shutil.which("ffmpeg")
     if found:
         return found
+    for candidate in (
+            r"C:\Program Files\Topaz Labs LLC\Topaz Video AI\ffmpeg.exe",
+            r"C:\Program Files\EaseUS\EaseUS Data Recovery Wizard\VideoViewer\ffmpeg.exe"):
+        if Path(candidate).is_file():
+            return candidate
     raise RuntimeError("ffmpeg was not found. Download the tools, or put ffmpeg.exe in tools/ffmpeg.")
 
 

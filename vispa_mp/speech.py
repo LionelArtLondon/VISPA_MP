@@ -60,6 +60,47 @@ def turns_from_probs(probs, settings, sample_rate=SAMPLE_RATE):
             for begin, end in segment_probs(probs, settings, sample_rate)]
 
 
+def dialogue_turns(probs, settings, speaker_changes=(), sample_rate=SAMPLE_RATE):
+    """Split voiced intervals at measured changes, preserving silence boundaries.
+
+    Anonymous turn IDs describe timing, not character identity. Tiny fragments
+    and changes outside speech do not create extra marker opportunities.
+    """
+    import math
+    lines = turns_from_probs(probs, settings, sample_rate)
+    events = []
+    for event in speaker_changes or ():
+        if not isinstance(event, dict):
+            continue
+        time, confidence = event.get("time"), event.get("confidence")
+        if (isinstance(time, (int, float)) and not isinstance(time, bool) and math.isfinite(time)
+                and isinstance(confidence, (int, float)) and not isinstance(confidence, bool)
+                and math.isfinite(confidence) and 0.55 <= confidence <= 1):
+            events.append((float(time), float(confidence)))
+    events.sort()
+    minimum = max(0.20, min(0.35, float(setting(settings, "speech_min_duration_ms")) / 1000))
+    result = []
+    for line in lines:
+        accepted = []
+        previous = line["start"]
+        for time, confidence in events:
+            if time - previous >= minimum and line["end"] - time >= minimum:
+                if line["start"] < time < line["end"]:
+                    accepted.append((time, confidence))
+                    previous = time
+        if not accepted:
+            result.append(line)
+            continue
+        points = [line["start"]] + [time for time, _score in accepted] + [line["end"]]
+        for index, (begin, end) in enumerate(zip(points, points[1:])):
+            supports = [accepted[min(index, len(accepted) - 1)][1]]
+            if index:
+                supports.append(accepted[index - 1][1])
+            result.append({"start": begin, "end": end, "source": "speaker_change",
+                           "turn_id": f"voice-turn-{len(result)}", "confidence": min(supports)})
+    return result
+
+
 def map_turns(turns, start_frame, fps):
     """Timeline frames of turns whose zero is ``start_frame``."""
     mapped = []
@@ -67,7 +108,13 @@ def map_turns(turns, start_frame, fps):
         begin = int(round(start_frame + turn["start"] * fps))
         end = int(round(start_frame + turn["end"] * fps))
         if end > begin:
-            mapped.append({"start": begin, "end": end})
+            item = {"start": begin, "end": end}
+            for key in ("source", "speaker", "confidence"):
+                if key in turn:
+                    item[key] = turn[key]
+            if "turn_id" in turn:
+                item["turn_id"] = f"{start_frame}:{turn['turn_id']}"
+            mapped.append(item)
     return mapped
 
 

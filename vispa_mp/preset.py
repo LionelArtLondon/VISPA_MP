@@ -4,6 +4,8 @@ from json import loads
 import math
 from pathlib import Path
 
+from vispa_mp.marker_budget import BUDGET_DEFAULTS, valid_budget_value
+
 DEFAULTS = {
     "end_fraction": 0.30,
     "sharpness_floor": 0.5,
@@ -20,6 +22,8 @@ DEFAULTS = {
     "candidates_per_line": 4,
     "max_tagged_per_shot": 16,
     "spread_tagged": 6,
+    "split_long_shots": True,
+    "long_shot_seconds": 4.3,
     "require_open_mouth": True,
     "mouth_fallback": "sharp",
     "mouth_min": 0.20,
@@ -37,7 +41,7 @@ DEFAULTS = {
     "scene_colour": 0.35,
     "group_min": 0.35,
     "min_green_seconds": 2.0,
-    "compression": 0.35,
+    "compression": 0.5,
     # The page targets are for an episode of this length. A shorter In/Out range
     # gets its share: 4 minutes of a 24-minute episode aim at a sixth of the pages.
     # 0 applies the targets to whatever is analyzed.
@@ -50,8 +54,10 @@ DEFAULTS = {
     "core_page_target": 0.0,
     "total_page_min": 3,
     "total_page_max": 8,
+    **BUDGET_DEFAULTS,
     "skip_marked_shots": True,
     "use_in_out": True,
+    "learning_profile": "",
 }
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,14 +84,23 @@ def load(path=None):
 # What the user changed, kept between sessions. default.json is never rewritten.
 USER_PATH = ROOT / "presets" / "user.json"
 FRAME_FORMATS = ("Source", "16:9", "4:3", "3:2", "1:1", "2:3", "9:16", "Custom")
+PREVIEW_QUALITIES = ("Low", "Medium", "High")
 PREVIEW_DEFAULTS = {"show_board_labels": True, "frame_format": "Source",
-                    "frame_custom_width": 16.0, "frame_custom_height": 9.0}
+                    "frame_custom_width": 16.0, "frame_custom_height": 9.0,
+                    "preview_quality": "Medium"}
 VIEW_DEFAULTS = {"page_format": "A5", "orientation": "portrait", "custom_width": 148, "custom_height": 210,
-                 **PREVIEW_DEFAULTS}
+                 **PREVIEW_DEFAULTS, "suggestions_auto_open": False, "suggestions_detached": False,
+                 "suggestions_rows": 0, "pages_panel_width": 280, "review_tools_width": 280}
 
 
 def _valid_preview_value(key, value):
-    if key == "show_board_labels":
+    if key in ("pages_panel_width", "review_tools_width"):
+        return isinstance(value, int) and not isinstance(value, bool) and 160 <= value <= 2000
+    if key == "preview_quality":
+        return isinstance(value, str) and value in PREVIEW_QUALITIES
+    if key == "suggestions_rows":
+        return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 6
+    if key in ("show_board_labels", "suggestions_auto_open", "suggestions_detached"):
         return isinstance(value, bool)
     if key == "frame_format":
         return isinstance(value, str) and value in FRAME_FORMATS
@@ -107,6 +122,20 @@ def _same_kind(value, reference):
     return isinstance(value, type(reference))
 
 
+def valid_long_shot_value(key, value):
+    """Keep the decomposition switch and duration safe in portable settings."""
+    if key == "split_long_shots":
+        return isinstance(value, bool)
+    if key == "long_shot_seconds":
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return False
+        try:
+            return math.isfinite(value) and 1 <= value <= 120
+        except OverflowError:
+            return False
+    return True
+
+
 def _read_user(path):
     try:
         stored = loads(Path(path).read_text(encoding="utf-8"))
@@ -123,7 +152,8 @@ def load_user(path=None):
     settings = load()
     view = dict(VIEW_DEFAULTS)
     for key, value in _read_user(path or USER_PATH).items():
-        if key in DEFAULTS and _same_kind(value, DEFAULTS[key]):
+        if (key in DEFAULTS and _same_kind(value, DEFAULTS[key])
+                and valid_budget_value(key, value) and valid_long_shot_value(key, value)):
             settings[key] = value
         elif (key in VIEW_DEFAULTS and _same_kind(value, VIEW_DEFAULTS[key])
               and _valid_preview_value(key, value)):
@@ -138,7 +168,9 @@ FILE_KIND = "vispa-mp-settings"
 def export_settings(settings, path):
     """A settings file to load later: every marker setting, the page format left out."""
     import json
-    values = {key: settings[key] for key in DEFAULTS if key in (settings or {})}
+    values = {key: settings[key] for key in DEFAULTS
+              if key in (settings or {}) and valid_budget_value(key, settings[key])
+              and valid_long_shot_value(key, settings[key])}
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps({"kind": FILE_KIND, "version": 1, "settings": values},
@@ -159,7 +191,8 @@ def import_settings(path):
     if not isinstance(stored, dict):
         raise ValueError("This is not a VISPA MP settings file.")
     values = {key: value for key, value in stored.items()
-              if key in DEFAULTS and _same_kind(value, DEFAULTS[key])}
+              if key in DEFAULTS and _same_kind(value, DEFAULTS[key])
+              and valid_budget_value(key, value) and valid_long_shot_value(key, value)}
     if not values:
         raise ValueError("This file holds no VISPA MP setting.")
     return values
@@ -172,7 +205,8 @@ def save_user(settings, view, path=None):
     shipped = load()
     changed = {}
     for key, value in (settings or {}).items():
-        if key in DEFAULTS and value != shipped.get(key):
+        if (key in DEFAULTS and value != shipped.get(key) and valid_budget_value(key, value)
+                and valid_long_shot_value(key, value)):
             changed[key] = value
     for key, value in (view or {}).items():
         if key in VIEW_DEFAULTS and value != VIEW_DEFAULTS[key] and _valid_preview_value(key, value):

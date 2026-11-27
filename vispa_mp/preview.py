@@ -3,9 +3,10 @@
 from math import isfinite
 
 from PySide6.QtCore import QRectF
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QPainter
 
 from vispa_mp.preset import FRAME_FORMATS
+from vispa_mp.preview_quality import high_source, low_source, normalized_quality
 
 
 def frame_ratio(format_name, custom_width=16, custom_height=9):
@@ -34,7 +35,7 @@ def crop_rect(source_width, source_height, target_width, target_height):
     return QRectF((source_width - width) / 2, (source_height - height) / 2, width, height)
 
 
-def draw_preview(painter, pixmap, target_rect, fallback, crop=False):
+def draw_preview(painter, pixmap, target_rect, fallback, crop=False, quality="Medium"):
     """Paint a source fit or center crop, clearing the entire preview first."""
     target = QRectF(target_rect)
     painter.fillRect(target, QColor(fallback))
@@ -48,4 +49,16 @@ def draw_preview(painter, pixmap, target_rect, fallback, crop=False):
         width, height = source.width() * scale, source.height() * scale
         target = QRectF(target.x() + (target.width() - width) / 2,
                         target.y() + (target.height() - height) / 2, width, height)
-    painter.drawPixmap(target, pixmap, source)
+    quality = normalized_quality(quality)
+    painter.save()
+    try:
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, quality != "Low")
+        if quality == "Low":
+            pixmap, source = low_source(pixmap, source)
+        elif quality == "High":
+            prepared = high_source(painter, pixmap, source, target)
+            if prepared is not None:
+                pixmap, source = prepared, QRectF(prepared.rect())
+        painter.drawPixmap(target, pixmap, source)
+    finally:
+        painter.restore()

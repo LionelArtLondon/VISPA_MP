@@ -42,16 +42,7 @@ def plan_apply(existing, proposals, start=None, end=None):
 
 
 def cue_warning(track_names):
-    """Video 1 stays the analysed track. The exporter looks for CUE_SOURCE by name."""
-    names = list(track_names or [])
-    if not names:
+    """Legacy helper name: MP needs Video 1, regardless of its track name."""
+    if not list(track_names or []):
         return "Video 1 was not found."
-    cue = [index for index, name in enumerate(names, 1) if str(name or "").strip().lower() == "cue_source"]
-    if not cue:
-        return ("No track is named CUE_SOURCE. Analysis uses video 1. "
-                "The Cue exporter looks for a track with that name.")
-    if cue != [1]:
-        listed = ", ".join(str(index) for index in cue)
-        return (f"CUE_SOURCE is not video 1 (track {listed}). "
-                "Analysis stays on video 1.")
     return ""

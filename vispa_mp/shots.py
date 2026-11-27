@@ -8,6 +8,8 @@ from statistics import median
 
 import numpy as np
 
+from vispa_mp.long_shots import decompose_shot
+
 METHOD = dict(name="frame_difference", version=3, size=[64, 36], grey=[12.0, 3.5], colours=[0.2, 3.0],
               shapes=[0.35, 4.0], window=12, min_shot_us=200_000)
 WINDOW = METHOD["window"]
@@ -154,11 +156,12 @@ def _collapse_frames(frames):
     return [by_frame[key] for key in sorted(by_frame)]
 
 
-def build_shots(clips, strips, timeline_fps, cancel=None, report=None):
+def build_shots(clips, strips, timeline_fps, cancel=None, report=None, settings=None):
     """Shots on video 1. A clip edge is a cut; a long clip is also cut inside.
 
     ``strips[i]`` is the RGB filmstrip of ``clips[i]``, one picture per source frame
-    from ``source_start`` inclusive.
+    from ``source_start`` inclusive. Long shots can also be divided at sustained
+    internal reframings before the candidate-image cap is applied.
     """
     shots = []
     previous = None
@@ -197,7 +200,7 @@ def build_shots(clips, strips, timeline_fps, cancel=None, report=None):
             if shot_end <= shot_start:
                 shot_end = shot_start + 1
             neighbors = [frame["neighbor"] for frame in frames]
-            shots.append({
+            shot = {
                 "start": int(shot_start),
                 "end": int(shot_end),
                 "opening": opening,
@@ -206,7 +209,8 @@ def build_shots(clips, strips, timeline_fps, cancel=None, report=None):
                 "cut_shape": round(float(shape), 4),
                 "motion": round(float(sum(neighbors) / len(neighbors)), 4),
                 "frames": frames,
-            })
+            }
+            shots.extend(decompose_shot(shot, float(timeline_fps), settings, cancel))
             previous = piece[-1]
             first = False
     return shots

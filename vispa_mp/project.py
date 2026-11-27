@@ -18,7 +18,7 @@ from zipfile import BadZipFile, ZIP_DEFLATED, ZIP_STORED, ZipFile
 
 from PIL import Image
 
-from vispa_mp.preset import DEFAULTS, FRAME_FORMATS
+from vispa_mp.preset import DEFAULTS, FRAME_FORMATS, PREVIEW_QUALITIES, valid_long_shot_value
 from vispa_mp.timebase import parse_timecode
 from vispa_mp.timeline_identity import normalize_identity
 
@@ -56,12 +56,55 @@ def _invalid(detail):
 def _image_nodes(project):
     for shot in project["analysis"]["shots"]:
         yield from shot["frames"]
-    yield from project["proposals"]
+    for proposal in project["proposals"]:
+        yield proposal
+        yield from proposal.get("timeline_candidates", [])
 
 
 def _interval(value):
     return (isinstance(value, dict) and _integer(value.get("start"))
             and _integer(value.get("end")) and value["end"] >= value["start"])
+
+
+def _dialogue_label(value):
+    return (isinstance(value, str) and 0 < len(value) <= 256 and bool(value.strip())
+            and not any(ord(character) < 32 for character in value))
+
+
+def _validate_dialogue_interval(part):
+    """Optional voice-change metadata; old speech intervals remain readable."""
+    if any(key in part for key in ("source", "turn_id", "speaker", "confidence")):
+        if part["end"] <= part["start"]:
+            _invalid("a dialogue interval cannot be read")
+    if "source" in part and part["source"] not in ("voice_activity", "speaker_change"):
+        _invalid("a dialogue interval's source cannot be read")
+    for key in ("turn_id", "speaker"):
+        if key in part and not _dialogue_label(part[key]):
+            _invalid("a dialogue interval's voice label cannot be read")
+    if "confidence" in part and (not _number(part["confidence"]) or not 0 <= part["confidence"] <= 1):
+        _invalid("a dialogue interval's change support cannot be read")
+
+
+def _validate_speaker_changes(part, fps):
+    """Relative seconds stay inside this audio clip, never timeline frames."""
+    changes = part.get("speaker_changes", [])
+    duration = (part["end"] - part["start"]) / fps
+    if not isinstance(changes, list) or len(changes) > 500_000:
+        _invalid("the saved voice changes cannot be read")
+    for change in changes:
+        if (not isinstance(change, dict) or not _number(change.get("time"))
+                or not 0 < change["time"] < duration
+                or not _number(change.get("confidence")) or not 0 <= change["confidence"] <= 1):
+            _invalid("a saved voice change cannot be read")
+    if "dialogue_status" in part:
+        status = part["dialogue_status"]
+        if (not isinstance(status, dict) or status.get("state") not in ("ready", "unavailable", "failed")
+                or not _dialogue_label(status.get("engine"))
+                or not isinstance(status.get("detail"), str) or len(status["detail"]) > 4096
+                or "\x00" in status["detail"]
+                or not _integer(status.get("changes")) or status["changes"] != len(changes)
+                or status["state"] != "ready" and status["changes"] != 0):
+            _invalid("the saved dialogue analysis status cannot be read")
 
 
 def _validate_cameras(cameras):
@@ -152,6 +195,11 @@ def _validate(project, internal=False):
     if span is not None and (not isinstance(span, list) or len(span) != 2
                              or not all(_integer(frame) for frame in span) or span[1] < span[0]):
         _invalid("the analyzed In/Out range cannot be read")
+    timeline_span = analysis.get("timeline_range")
+    if timeline_span is not None and (not isinstance(timeline_span, list) or len(timeline_span) != 2
+                                      or not all(_integer(frame) for frame in timeline_span)
+                                      or timeline_span[1] < timeline_span[0]):
+        _invalid("the analyzed timeline duration cannot be read")
     for key in ("video_clips", "audio_clips", "markers"):
         if key in snapshot and (not isinstance(snapshot[key], list)
                                 or any(not isinstance(item, dict) for item in snapshot[key])):
@@ -159,11 +207,21 @@ def _validate(project, internal=False):
     shots = analysis.get("shots")
     if not isinstance(shots, list):
         _invalid("the analyzed images are missing")
+    if "shot_decomposition" in analysis:
+        decomposition = analysis["shot_decomposition"]
+        if (not isinstance(decomposition, dict)
+                or not isinstance(decomposition.get("enabled"), bool)
+                or not valid_long_shot_value("long_shot_seconds", decomposition.get("seconds"))):
+            _invalid("the analyzed shot decomposition cannot be read")
     for shot in shots:
         if (not isinstance(shot, dict) or not _integer(shot.get("start"))
                 or not _integer(shot.get("end")) or shot["end"] <= shot["start"]
                 or not isinstance(shot.get("frames"), list)):
             _invalid("an analyzed shot cannot be read")
+        if "parent_start" in shot or "parent_end" in shot:
+            if (not _integer(shot.get("parent_start")) or not _integer(shot.get("parent_end"))
+                    or not shot["parent_start"] <= shot["start"] < shot["end"] <= shot["parent_end"]):
+                _invalid("an analyzed shot's original bounds cannot be read")
         for frame in shot["frames"]:
             if not isinstance(frame, dict) or not _integer(frame.get("frame")):
                 _invalid("an analyzed image cannot be read")
@@ -174,11 +232,26 @@ def _validate(project, internal=False):
         if (not isinstance(marker, dict) or not _integer(marker.get("frame"))
                 or marker.get("color") not in ("Green", "Blue", "Cyan")):
             _invalid("a prepared marker cannot be read")
+        if "speech_quality_ok" in marker and not isinstance(marker["speech_quality_ok"], bool):
+            _invalid("a prepared marker's verified speech preference cannot be read")
+        if "dialogue_turn" in marker and not _integer(marker["dialogue_turn"]):
+            _invalid("a prepared marker's dialogue turn cannot be read")
+        if "dialogue_speaker" in marker and not _dialogue_label(marker["dialogue_speaker"]):
+            _invalid("a prepared marker's dialogue voice label cannot be read")
         if "origin_frame" in marker and not _integer(marker["origin_frame"]):
             _invalid("a prepared marker's original frame cannot be read")
         for key in ("note", "name", "rule"):
             if key in marker and not isinstance(marker[key], str):
                 _invalid("a prepared marker caption cannot be read")
+        if "timeline_candidates" in marker:
+            candidates = marker["timeline_candidates"]
+            if (not isinstance(candidates, list) or not 1 <= len(candidates) <= 5
+                    or any(not isinstance(candidate, dict) or not _integer(candidate.get("frame"))
+                           or not isinstance(candidate.get("image"), str) or not candidate["image"]
+                           or "timeline_candidates" in candidate for candidate in candidates)):
+                _invalid("a timeline marker's candidate images cannot be read")
+            if len({candidate["frame"] for candidate in candidates}) != len(candidates):
+                _invalid("a timeline marker's candidate images contain duplicate frames")
     for key in ("manual_frames",):
         if key in analysis and (not isinstance(analysis[key], list)
                                 or any(not _integer(frame) for frame in analysis[key])):
@@ -193,15 +266,29 @@ def _validate(project, internal=False):
             if key == "speech_tracks" and (not isinstance(part.get("probs"), list)
                                            or any(not _number(value) for value in part["probs"])):
                 _invalid("the saved speech probabilities cannot be read")
+            if key == "utterances":
+                _validate_dialogue_interval(part)
+            elif "speaker_changes" in part or "dialogue_status" in part:
+                _validate_speaker_changes(part, analysis["fps"])
     for key, value in project["settings"].items():
         default = DEFAULTS.get(key)
         if default is None:
             continue
         valid = (isinstance(value, bool) if isinstance(default, bool) else
                  _number(value) if isinstance(default, (int, float)) else isinstance(value, type(default)))
-        if not valid:
+        if not valid or not valid_long_shot_value(key, value):
             _invalid(f"the {key} setting cannot be read")
+        if key.startswith("global_markers_"):
+            from vispa_mp.marker_budget import valid_budget_value
+            if not valid_budget_value(key, value):
+                _invalid(f"the {key} setting cannot be read")
     view = project["view"]
+    if view.get("learning_profile") is not None:
+        from vispa_mp.learning_model import validate_profile
+        try:
+            validate_profile(view["learning_profile"])
+        except (TypeError, ValueError) as error:
+            _invalid(f"the personal selection profile cannot be read: {error}")
     if "page_layout" in view:
         _validate_page_layout(view["page_layout"])
     if "cameras" in view:
@@ -217,6 +304,15 @@ def _validate(project, internal=False):
             _invalid("the page dimensions cannot be read")
     if "show_board_labels" in view and not isinstance(view["show_board_labels"], bool):
         _invalid("the board label visibility cannot be read")
+    if "preview_quality" in view and (not isinstance(view["preview_quality"], str)
+                                      or view["preview_quality"] not in PREVIEW_QUALITIES):
+        _invalid("the preview quality cannot be read")
+    for key in ("suggestions_auto_open", "suggestions_detached"):
+        if key in view and not isinstance(view[key], bool):
+            _invalid("the suggestions display preference cannot be read")
+    if "suggestions_rows" in view and (not _integer(view["suggestions_rows"])
+                                       or not 0 <= view["suggestions_rows"] <= 6):
+        _invalid("the suggestions row preference cannot be read")
     for key in ("frame_custom_width", "frame_custom_height"):
         if key in view and (not _number(view[key]) or not 0.1 <= view[key] <= 100):
             _invalid("the preview frame proportions cannot be read")
@@ -250,6 +346,13 @@ def _validate(project, internal=False):
                     "tongue", "uvula", "upper_teeth_only", "lower_teeth_only", "clenched_teeth"):
             if key in node and not _number(node[key]):
                 _invalid("an image score cannot be read")
+        for role in ("core", "extra", "page"):
+            key = f"personal_{role}"
+            if key in node and (not _number(node[key]) or not 0 <= node[key] <= 1):
+                _invalid("a personal image preference cannot be read")
+        if "personal_extra_role" in node and (not _number(node["personal_extra_role"])
+                                             or not 0 <= node["personal_extra_role"] <= 1):
+            _invalid("a personal image role preference cannot be read")
         if "signature" in node and (not isinstance(node["signature"], list)
                                     or any(not _number(value) for value in node["signature"])):
             _invalid("an image signature cannot be read")

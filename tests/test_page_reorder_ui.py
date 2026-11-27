@@ -72,8 +72,8 @@ def test_a_page_start_can_finish_the_preceding_page_without_moving_its_video_mar
     assert window.mode == mode
     assert window._proposal(40)["color"] == PAGE
     hints = window.findChildren(QLabel)
-    assert any("Manual page order" in label.text() and "Resolve keeps timeline order" in label.text()
-               and not label.isHidden() for label in hints)
+    assert any("Manual page order" in label.text() and not label.isHidden() for label in hints)
+    assert "Resolve keeps timeline order" in window.manual_order_bar.toolTip()
 
 
 @pytest.mark.parametrize("mode", ["strip", "board"])
@@ -310,29 +310,40 @@ def test_drag_from_the_central_view_reaches_the_real_page_drop_target(qapp, monk
     original_proposals = deepcopy(window.proposals)
     original_payload = deepcopy(window.resolve_payload())
 
-    def drop_on_the_first_page(widget, frame, token, pixmap):
+    def drop_on_the_first_page(widget, frame, token, pixmap, frames=None):
         # Replace the native OS drag loop, retaining the real source signal,
         # MainWindow transport owner, MIME validation, target geometry and drop.
         calls.append((widget, frame, token))
         assert widget is window
         assert frame == 40 and token == window._drag_token
+        assert frames == [40]
         header = window._rows[10]["row"]
         global_point = header.mapToGlobal(header.rect().center())
         point = window.pages_panel.mapFromGlobal(global_point)
-        mime = marker_mime(frame, token)
+        mime = marker_mime(frame, token, frames=frames)
         mime_refs.append(mime)
+        before_hover = deepcopy((window.proposals, window._page_layout, window._selected_keys,
+                                 window.selected_frame, window.selected_page_id))
         enter = QDragEnterEvent(point, Qt.DropAction.MoveAction, mime,
                                Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
         enter._test_mime = mime
         QApplication.sendEvent(window.pages_panel, enter)
         assert enter.isAccepted()
         assert window.pages_panel._drop_target_info[:2] == (10, None)
-        assert window.pages_panel._drop_indicator.isVisible()
+        assert window.pages_panel._drop_indicator.isHidden()
+        assert header.property("dropTarget") is True
+        hint = header.findChild(QLabel, "page-drop-hint-10")
+        assert hint is not None and hint.isVisible()
+        assert not hint.pixmap().isNull()
+        assert (window.proposals, window._page_layout, window._selected_keys,
+                window.selected_frame, window.selected_page_id) == before_hover
         drop = QDropEvent(QPointF(point), Qt.DropAction.MoveAction, mime,
                           Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
         drop._test_mime = mime
         QApplication.sendEvent(window.pages_panel, drop)
         assert drop.isAccepted()
+        assert not header.property("dropTarget")
+        assert hint.isHidden()
         return Qt.DropAction.MoveAction
 
     monkeypatch.setattr("vispa_mp.ui.start_marker_drag", drop_on_the_first_page)

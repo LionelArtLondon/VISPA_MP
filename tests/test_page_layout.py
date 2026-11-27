@@ -5,7 +5,7 @@ from copy import deepcopy
 import pytest
 
 from vispa_mp.markers import CORE, EXTRA, PAGE
-from vispa_mp.page_layout import capture_layout, move_frame, reconcile_layout
+from vispa_mp.page_layout import capture_layout, move_frame, move_frames, reconcile_layout
 
 
 def proposal(frame, color=CORE):
@@ -118,3 +118,54 @@ def test_reconcile_is_idempotent_and_moves_preserve_the_exact_proposal_set():
 def test_reconcile_rejects_duplicate_page_ids_because_drop_targets_must_be_unambiguous():
     with pytest.raises(ValueError, match="page IDs"):
         reconcile_layout([{"id": 1, "frames": [10]}, {"id": 1, "frames": [20]}], [proposal(10), proposal(20)])
+
+
+def test_batch_move_follows_existing_editorial_order_and_keeps_the_destination_id():
+    layout = [{"id": 10, "frames": [30, 10]}, {"id": 20, "frames": [50, 20, 40]},
+              {"id": 60, "frames": [60]}]
+    original = deepcopy(layout)
+    assert move_frames(layout, [60, 10, 30, 50], 20, 40) == [
+        {"id": 20, "frames": [20, 30, 10, 50, 60, 40]},
+    ]
+    assert layout == original
+
+
+@pytest.mark.parametrize("anchor,expected", [
+    (20, [10, 20, 40, 30, 50]),
+    (40, [10, 30, 20, 40, 50]),
+    (None, [10, 30, 50, 20, 40]),
+])
+def test_batch_insertion_anchor_inside_selection_uses_next_remaining_image(anchor, expected):
+    layout = [{"id": 10, "frames": [10, 20, 30, 40, 50]}]
+    assert move_frames(layout, [40, 20], 10, anchor) == [{"id": 10, "frames": expected}]
+
+
+@pytest.mark.parametrize("anchor", [20, 30, 40])
+def test_contiguous_selection_dropped_on_itself_or_successor_is_a_noop(anchor):
+    layout = [{"id": 10, "frames": [10, 20, 30, 40]}]
+    result = move_frames(layout, [30, 20], 10, anchor)
+    assert result == layout
+    assert result is not layout
+    assert result[0]["frames"] is not layout[0]["frames"]
+
+
+def test_batch_can_move_every_image_into_one_of_its_source_pages():
+    layout = [{"id": 10, "frames": [10, 20]}, {"id": 30, "frames": [30, 40]}]
+    assert move_frames(layout, [40, 30, 20, 10], 30, 30) == [
+        {"id": 30, "frames": [10, 20, 30, 40]},
+    ]
+
+
+@pytest.mark.parametrize("frames,target,anchor", [
+    ([], 10, None), ([20, 20], 10, None), ([20, 999], 10, None),
+    ([20], 999, None), ([20], 10, 40), ([True], 10, None),
+    ([20, 10.0], 10, None), ([20, "10"], 10, None),
+    ("20", 10, None), (20, 10, None), (None, 10, None),
+    ([20], True, None), ([20], 10, False),
+])
+def test_batch_invalid_or_stale_member_rejects_the_whole_move(frames, target, anchor):
+    layout = [{"id": 10, "frames": [10, 20]}, {"id": 40, "frames": [40]}]
+    original = deepcopy(layout)
+    with pytest.raises(ValueError):
+        move_frames(layout, frames, target, anchor)
+    assert layout == original

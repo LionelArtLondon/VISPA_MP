@@ -10,6 +10,8 @@ class ReviewCameraMixin:
         self._camera_image_width = base_image_width
         self._review_cameras = {"strip": None, "board": None}
         self._review_camera_context = None
+        self._review_camera_source = None
+        self._review_camera_edit = None
         self._camera_pending = {"strip": True, "board": True}
         self._applying_camera = False
         self._camera_timer = QTimer(self)
@@ -22,11 +24,74 @@ class ReviewCameraMixin:
 
     def _sync_review_camera_context(self):
         context = self._camera_context()
-        if context != self._review_camera_context:
+        source_changed = self.analysis is not self._review_camera_source
+        if context != self._review_camera_context or source_changed:
             self._camera_timer.stop()
             self._review_camera_context = context
+            self._review_camera_source = self.analysis
+            if not source_changed and self._preserving_review_camera():
+                return
             self._review_cameras = {"strip": None, "board": None}
             self._camera_pending = {"strip": True, "board": True}
+            self._camera_timer.start(0)
+
+    def _camera_page_key(self):
+        """Identify the same editorial page across replacement of its start image."""
+        if self.view_filter == "starts":
+            return ("starts",)
+        if self.selected_page_id is None:
+            return None
+        if self._page_layout is not None:
+            return ("manual", self.selected_page_id)
+        proposal = self._proposal(self.selected_page_id)
+        origin = proposal.get("origin_frame", self.selected_page_id) if proposal else self.selected_page_id
+        return ("automatic", int(origin))
+
+    def _begin_review_camera_edit(self, *, allow_filter_change=False):
+        """Keep both view cameras until a local edit has rebuilt the current page.
+
+        A nested edit shares its outer transaction. Filters, other pages and
+        another analysis keep their normal fit behavior.
+        """
+        if (self._review_camera_edit is not None or self.analysis is None
+                or getattr(self, "worker", None) is not None
+                or getattr(self, "_learning_job_busy", False) or not self._view_items()):
+            return None
+        self._sync_review_camera_context()
+        self._remember_review_camera(self.mode)
+        token = {"source": self.analysis, "filter": self.view_filter,
+                 "page": self._camera_page_key(), "page_id": self.selected_page_id,
+                 "cameras": deepcopy(self._review_cameras), "allow_filter_change": allow_filter_change}
+        self._review_camera_edit = token
+        return token
+
+    def _preserving_review_camera(self):
+        token = self._review_camera_edit
+        if token is None:
+            return False
+        same_filter = (token["filter"] == self.view_filter
+                       or token["allow_filter_change"] and token["filter"] in ("core", "starts")
+                       and self.view_filter == "all")
+        return bool(token is not None and token["source"] is self.analysis
+                    and same_filter
+                    and (token["page_id"] == self.selected_page_id
+                         or token["page"] == self._camera_page_key()))
+
+    def _finish_review_camera_edit(self, token):
+        if token is None or token is not self._review_camera_edit:
+            return
+        preserve = self._preserving_review_camera()
+        self._review_camera_edit = None
+        if not preserve:
+            self._sync_review_camera_context()
+            return
+        self._camera_timer.stop()
+        self._review_camera_context = self._camera_context()
+        self._review_camera_source = self.analysis
+        self._review_cameras = deepcopy(token["cameras"])
+        self._camera_pending = {"strip": True, "board": True}
+        self._apply_review_camera(self.mode)
+        if self._camera_pending[self.mode]:
             self._camera_timer.start(0)
 
     def _queue_review_camera(self, mode):
@@ -117,5 +182,6 @@ class ReviewCameraMixin:
         self._camera_timer.stop()
         self._review_cameras = {mode: deepcopy((cameras or {}).get(mode)) for mode in ("strip", "board")}
         self._review_camera_context = self._camera_context()
+        self._review_camera_source = self.analysis
         self._camera_pending = {"strip": True, "board": True}
         self._camera_timer.start(0)
